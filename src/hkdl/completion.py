@@ -15,7 +15,7 @@ from argcomplete.completers import FilesCompleter, SuppressCompleter
 
 from .authoring import RESERVED_VARIANT_NAMES
 from .config import NAME_PATTERN, VERSION_PATTERN, ContractError, load_yaml_file
-from .runs import MAX_SEED, MODEL_ID_PATTERN, RUN_ID_PATTERN
+from .run_contracts import MAX_SEED, MODEL_ID_PATTERN, RUN_ID_PATTERN
 from .storage import RepositoryPaths, validate_repository_root
 
 SHELLS = ("bash", "zsh")

@@ -8,7 +8,9 @@ from datetime import datetime, timezone
 from typing import Any, Callable
 
 from .config import ContractError
-from .runs import ModelRecord, RunRecord, RunStore, validate_tracker
+from .run_contracts import validate_tracker
+from .runs import ModelRecord, RunRecord, RunStore
+from .status_index import IndexReport, StatusIndex, VariantInventory
 from .storage import RepositoryPaths
 
 
@@ -31,20 +33,58 @@ class Status:
     ) -> dict[str, Any]:
         if variant is not None and experiment is None:
             raise ContractError("Variant status filter requires Experiment")
+        observed_at = self._observed_at()
         if run_id is not None:
             if experiment is None or variant is None:
                 raise ContractError("Run status filter requires Experiment and Variant")
             records = [self.store.load(experiment, variant, run_id)]
-        else:
-            records = self.store.scan(experiment=experiment, variant=variant)
+            return self._tree(
+                records,
+                include_all_models=False,
+                observed_at=observed_at,
+            )
+        return StatusIndex(self.store.repository).query(
+            experiment=experiment,
+            variant=variant,
+            observed_at=observed_at,
+            load=lambda inventory: self._project_variant(inventory, observed_at),
+        )
+
+    def index_status(self) -> IndexReport:
+        return StatusIndex(self.store.repository).inspect()
+
+    def rebuild_index(self) -> IndexReport:
+        observed_at = self._observed_at()
+        return StatusIndex(self.store.repository).rebuild(
+            lambda inventory: self._project_variant(inventory, observed_at)
+        )
+
+    def _observed_at(self) -> datetime:
         observed_at = self._now()
         if observed_at.tzinfo is None or observed_at.utcoffset() is None:
             raise ContractError("Status clock must be timezone-aware")
-        return self._tree(
+        return observed_at
+
+    def _project_variant(
+        self,
+        inventory: VariantInventory,
+        observed_at: datetime,
+    ) -> dict[str, Any] | None:
+        records = self.store.scan(
+            experiment=inventory.experiment,
+            variant=inventory.variant,
+        )
+        document = self._tree(
             records,
-            include_all_models=run_id is None,
+            include_all_models=True,
             observed_at=observed_at,
         )
+        if not document["experiments"]:
+            return None
+        experiments = document["experiments"]
+        if len(experiments) != 1 or len(experiments[0]["variants"]) != 1:
+            raise ContractError("status Variant projection scope changed")
+        return experiments[0]["variants"][0]
 
     def _tree(
         self,
@@ -73,7 +113,7 @@ class Status:
                 experiment,
                 {"name": experiment, "variants": []},
             )
-            all_models = self.store.scan_models(
+            all_models = self.store.scan_model_manifests(
                 experiment=experiment,
                 variant=variant,
             )

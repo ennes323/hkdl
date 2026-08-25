@@ -5,18 +5,17 @@ from __future__ import annotations
 import json
 import math
 import os
-import re
 import stat
 from collections.abc import Mapping
 from pathlib import Path, PurePosixPath
 from typing import Any
 
 from .config import ContractError
+from .run_contracts import TRACKER_ID_PATTERN
 from .storage import atomic_replace, atomic_write_new
 
 ATTEMPT_ACTIONS = frozenset({"train", "eval", "export"})
 ATTEMPT_PHASES = frozenset({"running", "worker_done", "ready"})
-TRACKER_ID_PATTERN = re.compile(r"[a-z][a-z0-9_-]*:[^\s:][^\s]*")
 
 
 def new_attempt(

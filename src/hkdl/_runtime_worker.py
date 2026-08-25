@@ -246,13 +246,43 @@ def main() -> int:
 
 
 def _dispatch(request: dict[str, Any]) -> dict[str, Any]:
-    if request["operation"] == "tracker":
-        return _ensure_mlflow_run(request)
-    if request["operation"] == "tracker_metrics":
-        return _log_mlflow_metrics(request)
-    if request["operation"] == "tracker_finish":
-        return _finish_mlflow_run(request)
+    operation = request["operation"]
+    if operation in {"tracker", "tracker_metrics", "tracker_finish"}:
+        return _dispatch_tracker_operation(request)
+    protocol = _prepare_action_protocol(request)
 
+    if operation == "validate":
+        return _handle_validate(request, protocol)
+
+    if operation not in {"train", "evaluate", "export"}:
+        raise ValueError("unknown worker operation")
+    components, context, tracker_end = _prepare_action_context(request, protocol)
+    if operation == "train":
+        return _handle_train(request, components, context, tracker_end)
+    if operation == "evaluate":
+        return _handle_evaluate(request, components, context)
+    return _handle_export(request, components, context)
+
+
+@dataclass(frozen=True)
+class ActionProtocol:
+    entrypoint: Any
+    selected: dict[str, str]
+    action: str
+    required: frozenset[str]
+    cfg: Mapping[str, Any]
+
+
+def _dispatch_tracker_operation(request: dict[str, Any]) -> dict[str, Any]:
+    operation = request["operation"]
+    if operation == "tracker":
+        return _ensure_mlflow_run(request)
+    if operation == "tracker_metrics":
+        return _log_mlflow_metrics(request)
+    return _finish_mlflow_run(request)
+
+
+def _prepare_action_protocol(request: dict[str, Any]) -> ActionProtocol:
     source = Path(request["source"])
     entrypoint = _load_entrypoint(source)
     registry = _registry(entrypoint)
@@ -261,47 +291,56 @@ def _dispatch(request: dict[str, Any]) -> dict[str, Any]:
     _tracker_backends(request)
     required = ACTION_COMPONENTS[action]
     _resolve(registry, selected, required)
-    cfg = _freeze(request["cfg"])
-
-    if request["operation"] == "validate":
-        try:
-            _validate_tracker_environment(request["cfg"], request)
-        except ValueError as error:
-            return {"status": "contract_error", "error_type": type(error).__name__}
-        except Exception as error:
-            return {"status": "execution_error", "error_type": type(error).__name__}
-        try:
-            normalized = entrypoint.validate(
-                action,
-                cfg,
-                MappingProxyType(dict(selected)),
-                MappingProxyType(dict(request["exec"])),
-            )
-            exec_info, identity = _normalized_validation(
-                normalized,
-                request["exec"],
-                request.get("identity_fallback", {}),
-            )
-        except Exception as error:
-            return {"status": "contract_error", "error_type": type(error).__name__}
-        return {"status": "ok", "exec": exec_info, "identity": identity}
-
-    if request["operation"] not in {"train", "evaluate", "export"}:
-        raise ValueError("unknown worker operation")
-    components = entrypoint.assemble(
-        action,
-        cfg,
-        MappingProxyType(dict(selected)),
+    return ActionProtocol(
+        entrypoint, selected, action, required, _freeze(request["cfg"])
     )
-    if not isinstance(components, Mapping) or set(components) != required:
-        raise ValueError(f"{action} assembly returned invalid components")
+
+
+def _handle_validate(
+    request: dict[str, Any],
+    protocol: ActionProtocol,
+) -> dict[str, Any]:
+    try:
+        _validate_tracker_environment(request["cfg"], request)
+    except ValueError as error:
+        return {"status": "contract_error", "error_type": type(error).__name__}
+    except Exception as error:
+        return {"status": "execution_error", "error_type": type(error).__name__}
+    try:
+        normalized = protocol.entrypoint.validate(
+            protocol.action,
+            protocol.cfg,
+            MappingProxyType(dict(protocol.selected)),
+            MappingProxyType(dict(request["exec"])),
+        )
+        exec_info, identity = _normalized_validation(
+            normalized,
+            request["exec"],
+            request.get("identity_fallback", {}),
+        )
+    except Exception as error:
+        return {"status": "contract_error", "error_type": type(error).__name__}
+    return {"status": "ok", "exec": exec_info, "identity": identity}
+
+
+def _prepare_action_context(
+    request: dict[str, Any],
+    protocol: ActionProtocol,
+) -> tuple[Mapping[str, Any], RunContext, Any]:
+    components = protocol.entrypoint.assemble(
+        protocol.action,
+        protocol.cfg,
+        MappingProxyType(dict(protocol.selected)),
+    )
+    if not isinstance(components, Mapping) or set(components) != protocol.required:
+        raise ValueError(f"{protocol.action} assembly returned invalid components")
     run_dir = Path(request["run_dir"]).absolute()
     export_dir = Path(
         request.get("export_dir", run_dir / "artifacts/export")
     ).absolute()
     tracker, tracker_end = _training_tracker(request)
     context = RunContext(
-        cfg=cfg,
+        cfg=protocol.cfg,
         paths=RunPaths(
             run_dir=run_dir,
             checkpoints=run_dir / "artifacts/checkpoints",
@@ -325,58 +364,80 @@ def _dispatch(request: dict[str, Any]) -> dict[str, Any]:
             else None
         ),
     )
-    if action == "train":
-        try:
-            result = components["trainer"].fit(context)
-            if isinstance(result, Mapping):
-                best = result["best_checkpoint"]
-                last = result["last_checkpoint"]
-            else:
-                best = result.best_checkpoint
-                last = result.last_checkpoint
-            response = {
-                "status": "ok",
-                "best_checkpoint": str(best),
-                "last_checkpoint": str(last),
-            }
-            tracker_end(None)
-            if "local" in _tracker_backends(request):
-                response["metrics"] = {
-                    "history": "metrics/train.jsonl",
-                    "summary": "metrics/train-summary.json",
-                }
-            _record_worker_done(context._attempt_path, response)
-            return response
-        except KeyboardInterrupt:
-            tracker_end("KILLED")
-            raise
-        except BaseException:
-            tracker_end("FAILED")
-            raise
+    return components, context, tracker_end
 
-    checkpoint = Path(request["checkpoint"])
-    if action == "eval":
-        result = components["evaluator"].evaluate(context, checkpoint)
-        if not isinstance(result, Mapping):
-            raise ValueError("evaluator result must be a mapping")
-        if set(result) == {"values", "files"}:
-            values = result["values"]
-            files = result["files"]
-            if not isinstance(values, Mapping):
-                raise ValueError("evaluator values must be a mapping")
-            if not isinstance(files, Sequence) or isinstance(files, (str, bytes)):
-                raise ValueError("evaluator files must be a sequence")
-            response = {
-                "status": "ok",
-                "values": dict(values),
-                "files": [str(path) for path in files],
-            }
+
+def _handle_train(
+    request: dict[str, Any],
+    components: Mapping[str, Any],
+    context: RunContext,
+    tracker_end: Any,
+) -> dict[str, Any]:
+    try:
+        result = components["trainer"].fit(context)
+        if isinstance(result, Mapping):
+            best = result["best_checkpoint"]
+            last = result["last_checkpoint"]
         else:
-            response = {"status": "ok", "values": dict(result), "files": []}
+            best = result.best_checkpoint
+            last = result.last_checkpoint
+        response = {
+            "status": "ok",
+            "best_checkpoint": str(best),
+            "last_checkpoint": str(last),
+        }
+        tracker_end(None)
+        if "local" in _tracker_backends(request):
+            response["metrics"] = {
+                "history": "metrics/train.jsonl",
+                "summary": "metrics/train-summary.json",
+            }
         _record_worker_done(context._attempt_path, response)
         return response
+    except KeyboardInterrupt:
+        tracker_end("KILLED")
+        raise
+    except BaseException:
+        tracker_end("FAILED")
+        raise
 
-    result = components["exporter"].export(context, checkpoint)
+
+def _handle_evaluate(
+    request: dict[str, Any],
+    components: Mapping[str, Any],
+    context: RunContext,
+) -> dict[str, Any]:
+    result = components["evaluator"].evaluate(context, Path(request["checkpoint"]))
+    if not isinstance(result, Mapping):
+        raise ValueError("evaluator result must be a mapping")
+    if set(result) == {"values", "files"}:
+        response = _evaluation_response(result)
+    else:
+        response = {"status": "ok", "values": dict(result), "files": []}
+    _record_worker_done(context._attempt_path, response)
+    return response
+
+
+def _evaluation_response(result: Mapping[str, Any]) -> dict[str, Any]:
+    values = result["values"]
+    files = result["files"]
+    if not isinstance(values, Mapping):
+        raise ValueError("evaluator values must be a mapping")
+    if not isinstance(files, Sequence) or isinstance(files, (str, bytes)):
+        raise ValueError("evaluator files must be a sequence")
+    return {
+        "status": "ok",
+        "values": dict(values),
+        "files": [str(path) for path in files],
+    }
+
+
+def _handle_export(
+    request: dict[str, Any],
+    components: Mapping[str, Any],
+    context: RunContext,
+) -> dict[str, Any]:
+    result = components["exporter"].export(context, Path(request["checkpoint"]))
     if not isinstance(result, Sequence) or isinstance(result, (str, bytes)):
         raise ValueError("exporter result must be a sequence")
     response = {"status": "ok", "files": [str(path) for path in result]}
@@ -404,64 +465,18 @@ def _ensure_mlflow_run(request: dict[str, Any]) -> dict[str, Any]:
 
     client = mlflow.tracking.MlflowClient(tracking_uri=uri)
     experiment_name = cfg["experiment"]["name"]
-    experiment = client.get_experiment_by_name(experiment_name)
-    if experiment is None:
-        try:
-            experiment_id = client.create_experiment(experiment_name)
-        except Exception:
-            experiment = client.get_experiment_by_name(experiment_name)
-            if experiment is None:
-                raise
-            experiment_id = experiment.experiment_id
-    else:
-        experiment_id = experiment.experiment_id
-    run_dir = Path(request["run_dir"])
-    run_id = run_dir.name
+    experiment_id = _mlflow_experiment_id(client, experiment_name)
+    run_id = Path(request["run_dir"]).name
     variant_name = cfg["variant"]["name"]
     run_key = _run_key(cfg, run_id)
-    runs = client.search_runs(
-        [experiment_id],
-        filter_string=f"tags.`hkdl.run_key` = '{run_key}'",
-        max_results=2,
+    external_run_id = _owned_mlflow_run(
+        client,
+        experiment_id,
+        run_key,
+        request.get("current_tracker_run_id"),
     )
-    if len(runs) > 1:
-        raise TrackerOwnershipError("duplicate MLflow ownership identity")
-    current = request.get("current_tracker_run_id")
-    if current is not None:
-        if not isinstance(current, str) or not current.startswith("mlflow:"):
-            raise ValueError("invalid persisted MLflow identity")
-        expected = current.removeprefix("mlflow:")
-        if len(runs) != 1 or runs[0].info.run_id != expected:
-            raise TrackerOwnershipError("persisted MLflow ownership mismatch")
-        external_run_id = expected
-    elif runs:
-        external_run_id = runs[0].info.run_id
-    else:
-        template = cfg["variant"]["template"]
-        metadata = request.get("metadata", {})
-        if not isinstance(metadata, Mapping):
-            raise ValueError("tracker metadata must be a mapping")
-        tags = {
-            "hkdl.run_key": run_key,
-            "hkdl.address": f"{experiment_name}/{variant_name}/{run_id}",
-            "hkdl.experiment": experiment_name,
-            "hkdl.variant": variant_name,
-            "hkdl.run_id": run_id,
-            "hkdl.source_digest": cfg["provenance"]["source_digest"],
-            "hkdl.template.name": template["name"],
-            "hkdl.template.version": template["version"],
-        }
-        for key in (
-            "action",
-            "training_group",
-            "seed",
-            "model_id",
-            "evaluation_case",
-            "retry_of",
-        ):
-            value = metadata.get(key)
-            if value is not None:
-                tags[f"hkdl.{key}"] = str(value)
+    if external_run_id is None:
+        tags = _mlflow_tags(request, cfg, run_key, run_id, variant_name)
         created = client.create_run(
             experiment_id,
             tags=tags,
@@ -469,6 +484,77 @@ def _ensure_mlflow_run(request: dict[str, Any]) -> dict[str, Any]:
         )
         external_run_id = created.info.run_id
     return {"status": "ok", "tracker_run_id": f"mlflow:{external_run_id}"}
+
+
+def _mlflow_experiment_id(client: Any, experiment_name: str) -> str:
+    experiment = client.get_experiment_by_name(experiment_name)
+    if experiment is not None:
+        return experiment.experiment_id
+    try:
+        return client.create_experiment(experiment_name)
+    except Exception:
+        experiment = client.get_experiment_by_name(experiment_name)
+        if experiment is None:
+            raise
+        return experiment.experiment_id
+
+
+def _owned_mlflow_run(
+    client: Any,
+    experiment_id: str,
+    run_key: str,
+    current: Any,
+) -> str | None:
+    runs = client.search_runs(
+        [experiment_id],
+        filter_string=f"tags.`hkdl.run_key` = '{run_key}'",
+        max_results=2,
+    )
+    if len(runs) > 1:
+        raise TrackerOwnershipError("duplicate MLflow ownership identity")
+    if current is None:
+        return runs[0].info.run_id if runs else None
+    if not isinstance(current, str) or not current.startswith("mlflow:"):
+        raise ValueError("invalid persisted MLflow identity")
+    expected = current.removeprefix("mlflow:")
+    if len(runs) != 1 or runs[0].info.run_id != expected:
+        raise TrackerOwnershipError("persisted MLflow ownership mismatch")
+    return expected
+
+
+def _mlflow_tags(
+    request: dict[str, Any],
+    cfg: dict[str, Any],
+    run_key: str,
+    run_id: str,
+    variant_name: str,
+) -> dict[str, str]:
+    template = cfg["variant"]["template"]
+    metadata = request.get("metadata", {})
+    if not isinstance(metadata, Mapping):
+        raise ValueError("tracker metadata must be a mapping")
+    tags = {
+        "hkdl.run_key": run_key,
+        "hkdl.address": f"{cfg['experiment']['name']}/{variant_name}/{run_id}",
+        "hkdl.experiment": cfg["experiment"]["name"],
+        "hkdl.variant": variant_name,
+        "hkdl.run_id": run_id,
+        "hkdl.source_digest": cfg["provenance"]["source_digest"],
+        "hkdl.template.name": template["name"],
+        "hkdl.template.version": template["version"],
+    }
+    for key in (
+        "action",
+        "training_group",
+        "seed",
+        "model_id",
+        "evaluation_case",
+        "retry_of",
+    ):
+        value = metadata.get(key)
+        if value is not None:
+            tags[f"hkdl.{key}"] = str(value)
+    return tags
 
 
 def _log_mlflow_metrics(request: dict[str, Any]) -> dict[str, Any]:

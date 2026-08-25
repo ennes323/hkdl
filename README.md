@@ -1,9 +1,10 @@
 # HKDL
 
 HKDL authors self-contained ML Variants and records immutable execution
-history. Version 1.1.4 supports authoring, multi-seed training, immutable
+history. Version 1.1.5 supports authoring, multi-seed training, immutable
 Models, named evaluation cases with optional result artifacts, Variant-owned
 export, new-Run retry, brief, full, and aggregate-table status projections,
+disposable SQLite acceleration for multi-Variant status reads,
 live local metric following, Run-owned worker logs, shared locked Variant
 environments, explicit environment pruning, read-only storage reporting, shell
 completion, and opt-in MLflow tracking.
@@ -34,8 +35,14 @@ hkdl --version
 hkdl --help
 ```
 
-`setup.sh` is the maintained environment entrypoint. It performs a locked
-root sync and verifies the installed CLI. `activate.sh` activates that root
+`setup.sh` is the maintained environment entrypoint. It creates the root
+`.venv` as a relocatable environment when needed, normalizes an existing root
+environment after a checkout move, and recreates only a recognized incomplete
+virtual environment. It then performs a locked, non-editable full reinstall
+and verifies the installed CLI. A symlink, file, or non-venv directory at
+`.venv` is rejected without deletion. Setup changes only the generated root
+environment; authored Experiments, Variant source, Runs, Models, outputs, and
+other generated state are preserved. `activate.sh` activates that root
 environment and registers completion in the current Bash or Zsh session.
 
 ## Shell completion
@@ -66,8 +73,14 @@ hkdl update
 The command shows the installed and available versions, lists what will change
 and what will be preserved, and asks before updating. It fast-forwards the
 public source and reinstalls HKDL. Experiments, outputs, existing Variants, and
-authored schemas are not changed. Use `hkdl update --yes` only when confirmation
+authored schemas are not changed. The optional ignored `AGENTS.user.md` is
+user-owned and is also preserved. Use `hkdl update --yes` only when confirmation
 has already been provided.
+
+The public `AGENTS.md` contains HKDL-managed coding-agent defaults. Put local
+execution policy, resource limits, and reporting preferences in an optional
+root `AGENTS.user.md`; HKDL does not distribute, track, replace, migrate, or
+delete that file.
 
 ## End-to-end example
 
@@ -111,6 +124,22 @@ hkdl status demo baseline --output json
 with one row per Evaluation Case and metric. It is a text-only alternative to
 the brief and full hierarchy views.
 
+Range status queries may maintain `outputs/.hkdl-index.sqlite3` as a disposable
+projection. Authored Experiment/Variant files and generated Run/Model files
+remain authoritative; exact Run status continues to read its files directly.
+Missing, stale, incompatible, corrupt, or unavailable projection state falls
+back to validated files.
+
+```text
+hkdl index status
+hkdl index rebuild
+```
+
+`index status` inspects projection health without writing. `index rebuild`
+validates current authority, builds a sibling candidate database, and
+atomically replaces only the projection. Neither command migrates or rewrites
+authored or generated records.
+
 Inspect repository-owned local storage without changing it:
 
 ```text
@@ -119,7 +148,8 @@ hkdl storage --output json
 ```
 
 The report separates authored Experiment content, Variant environments, and
-outputs. Environment bytes count legacy per-Variant `.venv` directories plus
+outputs. Disposable status-index files and sidecars are excluded. Environment
+bytes count legacy per-Variant `.venv` directories plus
 the repository-local shared store once. Sizes are logical file bytes; symlinks
 are not followed. The command does not delete or prune anything.
 

@@ -8,6 +8,20 @@ Unless the user explicitly asks to develop HKDL itself, help them operate
 experiments through the HKDL CLI. Do not modify HKDL Core or the bundled
 Template catalog as part of normal experiment work.
 
+<!-- hkdl:user-guidance-contract version="1" -->
+
+## Guidance ownership
+
+This projected `AGENTS.md` is managed by HKDL. Do not edit it for local
+preferences. If `AGENTS.user.md` exists at the repository root, read it after
+this document before starting work. That optional file is user-owned: HKDL
+does not distribute, replace, migrate, or delete it, and source updates must
+preserve it.
+
+User guidance may refine local execution policy, resource limits, and reporting
+preferences. It does not waive HKDL's authoritative-data, immutability, path,
+validation, or confirmation rules in this document.
+
 ## Start
 
 - Work from the repository root.
@@ -80,6 +94,23 @@ Inspect the resulting state and Models:
 .venv/bin/hkdl storage
 .venv/bin/hkdl environment prune --dry-run
 ```
+
+`status` may maintain the disposable SQLite projection at
+`outputs/.hkdl-index.sqlite3`. Authored Experiment/Variant files and generated
+Run/Model files remain authoritative. A missing, stale, incompatible, corrupt,
+or unavailable projection must never be worked around by editing generated
+records.
+
+Inspect or explicitly rebuild the projection with:
+
+```text
+.venv/bin/hkdl index status
+.venv/bin/hkdl index rebuild
+```
+
+`index status` is read-only. `index rebuild` validates file authority, builds a
+sibling candidate, and atomically replaces only the disposable projection. It
+does not migrate or rewrite authored or generated files.
 
 `status` uses the compact brief view by default. Use `--full` for timestamps,
 configured Train dimensions, metric summaries, checkpoints, trackers, and Eval

@@ -2,11 +2,8 @@
 
 from __future__ import annotations
 
-import hashlib
 import os
 import shutil
-import stat
-from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
@@ -14,19 +11,20 @@ from typing import Any
 from .attempts import load_attempt, new_attempt, remove_attempt, write_attempt
 from .authoring import Authoring, ExperimentRecord, VariantRecord
 from .config import ContractError
+from .execution_planner import ExecutionPlanner, fallback_for_request
+from .run_contracts import (
+    TERMINAL_STATUSES,
+    evaluation_case,
+    metric_spec,
+    validate_tracker,
+    validate_evaluation_readiness,
+)
 from .runs import (
     ModelRecord,
     RunRecord,
     RunStore,
-    TERMINAL_STATUSES,
-    evaluation_case,
-    fingerprint_document,
-    metric_spec,
-    validate_tracker,
-    validate_evaluation_readiness,
-    validate_export_readiness,
-    validate_training_readiness,
 )
+from .receipt_committer import ReceiptCommitter
 from .runtime import (
     RuntimeFailure,
     RuntimeInterrupted,
@@ -36,10 +34,7 @@ from .runtime import (
 from .storage import (
     LockUnavailableError,
     RepositoryPaths,
-    atomic_write_new,
     compute_source_digest,
-    publish_directory,
-    publish_file,
     try_directory_lock,
 )
 
@@ -74,6 +69,8 @@ class RunExecution:
         self.authoring = Authoring(repository)
         self.runtime = runtime or VariantRuntime(repository)
         self.store = store or RunStore(repository)
+        self.planner = ExecutionPlanner(self._preflight)
+        self.receipts = ReceiptCommitter(repository, self.store, self.authoring)
 
     def train(
         self,
@@ -92,6 +89,7 @@ class RunExecution:
                     variant_name,
                     training_group,
                     python=environment.python,
+                    environment_descriptor=environment.descriptor,
                     seed=seed,
                     device=device,
                 )
@@ -105,6 +103,7 @@ class RunExecution:
         training_group: str,
         *,
         python: Path,
+        environment_descriptor: int,
         seed: int,
         device: str,
     ) -> RunRecord:
@@ -114,34 +113,19 @@ class RunExecution:
             action="train",
             python=python,
         )
-        selected = validate_training_readiness(
-            experiment.document,
-            variant.document,
-        )
-        target = {"training_group": training_group, "seed": seed}
-        fallback = {
-            "dataset": variant.document["dataset"],
-            "train": variant.document["train"],
-            "components": selected,
-        }
-        preflight = self._preflight(
-            python,
+        plan = self.planner.train(
+            experiment,
             variant,
-            action="train",
+            source_digest=source_digest,
             snapshot=snapshot,
-            selected=selected,
+            training_group=training_group,
             seed=seed,
             device=device,
-            fallback=fallback,
-            target=target,
+            python=python,
+            environment_descriptor=environment_descriptor,
         )
-        fingerprint = self._action_fingerprint(
-            action="train",
-            source_digest=source_digest,
-            selected=selected,
-            identity=preflight["identity"],
-            device=preflight["exec"]["device"],
-        )
+        target = plan.target
+        fingerprint = plan.fingerprint
 
         def validate_slot(
             runs: list[RunRecord],
@@ -171,7 +155,7 @@ class RunExecution:
             variant,
             action="train",
             target=target,
-            exec_info=preflight["exec"],
+            exec_info=plan.preflight["exec"],
             source_digest=source_digest,
             identity_fingerprint=fingerprint,
             snapshot=snapshot,
@@ -181,8 +165,9 @@ class RunExecution:
             record,
             variant,
             python=python,
-            selected=selected,
-            expected_identity=preflight["identity"],
+            environment_descriptor=environment_descriptor,
+            selected=plan.selected,
+            expected_identity=plan.preflight["identity"],
         )
 
     def evaluate(
@@ -204,6 +189,7 @@ class RunExecution:
                     training_group,
                     evaluation_case_name,
                     python=environment.python,
+                    environment_descriptor=environment.descriptor,
                     seed=seed,
                     device=device,
                 )
@@ -218,6 +204,7 @@ class RunExecution:
         evaluation_case_name: str,
         *,
         python: Path,
+        environment_descriptor: int,
         seed: int | str | None,
         device: str,
     ) -> list[RunRecord]:
@@ -227,34 +214,12 @@ class RunExecution:
             action="eval",
             python=python,
         )
-        models = [
-            model
-            for model in self.store.scan_models(
-                experiment=experiment_name,
-                variant=variant_name,
-            )
-            if model.document["training_group"] == training_group
-        ]
-        if not models:
-            raise LifecycleConflict(f"Training Group has no Models: {training_group}")
-        if seed is None:
-            if len(models) != 1:
-                raise LifecycleConflict(
-                    f"Training Group has multiple Models; specify --seed: "
-                    f"{training_group}"
-                )
-            selected_models = models
-        elif seed == "all":
-            selected_models = models
-        else:
-            selected_models = [
-                model for model in models if model.document["seed"] == seed
-            ]
-            if not selected_models:
-                raise LifecycleConflict(
-                    f"Training Group seed has no Model: {training_group}/{seed}"
-                )
-        selected_models.sort(key=lambda item: item.document["seed"])
+        selected_models = self._evaluation_models(
+            experiment_name,
+            variant_name,
+            training_group,
+            seed,
+        )
 
         selected = validate_evaluation_readiness(
             experiment.document,
@@ -265,45 +230,31 @@ class RunExecution:
         metrics = metric_spec(variant.document, evaluation_case_name)
         results: list[RunRecord] = []
         for model in selected_models:
-            if self._evaluation_exists(
+            if self._skip_existing_evaluation(
                 experiment_name,
                 variant_name,
                 model.document["model_id"],
                 evaluation_case_name,
+                allow_skip=seed == "all",
             ):
-                if seed == "all":
-                    continue
-                raise LifecycleConflict(
-                    "Model and Evaluation Case already have an execution"
-                )
-            target = {
-                "training_group": training_group,
-                "seed": model.document["seed"],
-                "model_id": model.document["model_id"],
-                "evaluation_case": evaluation_case_name,
-            }
-            fallback = {
-                "case": case_document,
-                "metrics": metrics,
-                "components": selected,
-            }
-            preflight = self._preflight(
-                python,
+                continue
+            plan = self.planner.evaluation(
+                experiment,
                 variant,
-                action="eval",
-                snapshot=snapshot,
-                selected=selected,
-                seed=model.document["seed"],
-                device=device,
-                fallback=fallback,
-                target=target,
-            )
-            fingerprint = self._action_fingerprint(
-                action="eval",
+                model,
                 source_digest=source_digest,
+                snapshot=snapshot,
+                training_group=training_group,
+                evaluation_case_name=evaluation_case_name,
                 selected=selected,
-                identity=preflight["identity"],
+                case_document=case_document,
+                metrics=metrics,
+                device=device,
+                python=python,
+                environment_descriptor=environment_descriptor,
             )
+            target = plan.target
+            fingerprint = plan.fingerprint
 
             def validate_slot(
                 runs: list[RunRecord],
@@ -337,7 +288,7 @@ class RunExecution:
                 variant,
                 action="eval",
                 target=target,
-                exec_info=preflight["exec"],
+                exec_info=plan.preflight["exec"],
                 source_digest=source_digest,
                 identity_fingerprint=fingerprint,
                 snapshot=snapshot,
@@ -349,8 +300,9 @@ class RunExecution:
                     variant,
                     model,
                     python=python,
-                    selected=selected,
-                    expected_identity=preflight["identity"],
+                    environment_descriptor=environment_descriptor,
+                    selected=plan.selected,
+                    expected_identity=plan.preflight["identity"],
                 )
             )
         return results
@@ -372,6 +324,7 @@ class RunExecution:
                     variant_name,
                     model_id,
                     python=environment.python,
+                    environment_descriptor=environment.descriptor,
                     device=device,
                 )
         except RuntimeFailure as error:
@@ -384,6 +337,7 @@ class RunExecution:
         model_id: str,
         *,
         python: Path,
+        environment_descriptor: int,
         device: str,
     ) -> RunRecord:
         model = self.store.load_model(experiment_name, variant_name, model_id)
@@ -393,32 +347,18 @@ class RunExecution:
             action="export",
             python=python,
         )
-        selected = validate_export_readiness(
-            experiment.document,
-            variant.document,
-        )
-        target = {"model_id": model_id}
-        fallback = {
-            "infer": variant.document["infer"],
-            "components": selected,
-        }
-        preflight = self._preflight(
-            python,
+        plan = self.planner.export(
+            experiment,
             variant,
-            action="export",
-            snapshot=snapshot,
-            selected=selected,
-            seed=model.document["seed"],
-            device=device,
-            fallback=fallback,
-            target=target,
-        )
-        fingerprint = self._action_fingerprint(
-            action="export",
+            model,
             source_digest=source_digest,
-            selected=selected,
-            identity=preflight["identity"],
+            snapshot=snapshot,
+            device=device,
+            python=python,
+            environment_descriptor=environment_descriptor,
         )
+        target = plan.target
+        fingerprint = plan.fingerprint
 
         def validate_slot(
             runs: list[RunRecord],
@@ -437,7 +377,7 @@ class RunExecution:
             variant,
             action="export",
             target=target,
-            exec_info=preflight["exec"],
+            exec_info=plan.preflight["exec"],
             source_digest=source_digest,
             identity_fingerprint=fingerprint,
             snapshot=snapshot,
@@ -448,8 +388,9 @@ class RunExecution:
             variant,
             model,
             python=python,
-            selected=selected,
-            expected_identity=preflight["identity"],
+            environment_descriptor=environment_descriptor,
+            selected=plan.selected,
+            expected_identity=plan.preflight["identity"],
         )
 
     def retry(
@@ -467,6 +408,7 @@ class RunExecution:
                     variant_name,
                     run_id,
                     python=environment.python,
+                    environment_descriptor=environment.descriptor,
                 )
         except RuntimeFailure as error:
             raise ExecutionFailure("retry", str(error)) from error
@@ -478,12 +420,70 @@ class RunExecution:
         run_id: str,
         *,
         python: Path,
+        environment_descriptor: int,
     ) -> RunRecord:
         original = self.store.load(experiment_name, variant_name, run_id)
-        abandoned_tracker: str | None = None
+        original, abandoned_tracker, recovered = self._prepare_retry_parent(original)
+        if recovered:
+            return original
+        current_variant = self.authoring.check_variant(
+            experiment_name,
+            variant_name,
+        )
+        current_digest = compute_source_digest(current_variant.path / "src")
+        if current_digest != original.request["source_digest"]:
+            raise ContractError("Variant source changed since the original Run")
+        self._finish_abandoned_tracker(
+            original,
+            current_variant,
+            python,
+            environment_descriptor,
+            abandoned_tracker,
+        )
+        runtime_variant = VariantRecord(
+            current_variant.path,
+            current_variant.experiment,
+            original.snapshot["variant"],
+        )
+        plan = self.planner.retry(
+            original,
+            runtime_variant,
+            source_digest=current_digest,
+            python=python,
+            environment_descriptor=environment_descriptor,
+        )
+        experiment = ExperimentRecord(
+            self.repository.experiments / experiment_name,
+            original.snapshot["experiment"],
+        )
+        retry = self._allocate_retry(
+            original,
+            experiment,
+            runtime_variant,
+            source_digest=current_digest,
+            fingerprint=plan.fingerprint,
+        )
+        return self._execute_retry(
+            original,
+            retry,
+            runtime_variant,
+            python=python,
+            environment_descriptor=environment_descriptor,
+            selected=plan.selected,
+            expected_identity=plan.preflight["identity"],
+        )
+
+    def _prepare_retry_parent(
+        self,
+        original: RunRecord,
+    ) -> tuple[RunRecord, str | None, bool]:
         try:
             with try_directory_lock(original.path):
-                original = self.store.load(experiment_name, variant_name, run_id)
+                original = self.store.load(
+                    original.request["experiment"],
+                    original.request["variant"],
+                    original.request["run_id"],
+                )
                 if self.store.direct_retry(original) is not None:
                     raise LifecycleConflict(
                         f"Run already has a retry: {original.address}"
@@ -493,88 +493,56 @@ class RunExecution:
                         f"completed Run cannot be retried: {original.address}"
                     )
                 journal = load_attempt(original.path / ".attempt.json")
-                if original.state["status"] in {"allocated", "running"}:
-                    if journal is not None and journal["phase"] == "ready":
-                        return self._commit_receipt(original, journal)
-                    checkpoint_changes: dict[str, Any] = {}
-                    if journal is not None and journal["action"] == "train":
-                        checkpoint = journal["checkpoint"]
-                        if checkpoint["best"] is not None:
-                            checkpoint_changes["best_checkpoint"] = checkpoint["best"]
-                        if checkpoint["last"] is not None:
-                            checkpoint_changes["last_checkpoint"] = checkpoint["last"]
-                    original = self.store.update_state(
-                        original,
-                        status="abandoned",
-                        reason="AbandonedExecution",
-                        **checkpoint_changes,
-                    )
-                    abandoned_tracker = original.state["tracker_run_id"]
+                if original.state["status"] not in {"allocated", "running"}:
+                    return original, None, False
+                if journal is not None and journal["phase"] == "ready":
+                    return self.receipts.commit_receipt(original), None, True
+                original = self.store.update_state(
+                    original,
+                    status="abandoned",
+                    reason="AbandonedExecution",
+                    **_retry_checkpoint_changes(journal),
+                )
+                return original, original.state["tracker_run_id"], False
         except LockUnavailableError as error:
             raise LifecycleConflict(f"Run is busy: {original.address}") from error
 
-        current_variant = self.authoring.check_variant(
-            experiment_name,
-            variant_name,
-        )
-        current_digest = compute_source_digest(current_variant.path / "src")
-        if current_digest != original.request["source_digest"]:
-            raise ContractError("Variant source changed since the original Run")
+    def _finish_abandoned_tracker(
+        self,
+        original: RunRecord,
+        variant: VariantRecord,
+        python: Path,
+        environment_descriptor: int,
+        tracker_run_id: str | None,
+    ) -> None:
+        if tracker_run_id is None:
+            return
         try:
-            if abandoned_tracker is not None:
-                with try_directory_lock(original.path) as descriptor:
-                    self.runtime.finish_tracker(
-                        python,
-                        current_variant,
-                        tracker_run_id=abandoned_tracker,
-                        status="KILLED",
-                        lock_descriptor=descriptor,
-                    )
+            with try_directory_lock(original.path) as descriptor:
+                self.runtime.finish_tracker(
+                    python,
+                    variant,
+                    tracker_run_id=tracker_run_id,
+                    status="KILLED",
+                    lock_descriptor=descriptor,
+                    environment_descriptor=environment_descriptor,
+                )
         except RuntimeFailure as error:
             raise ExecutionFailure(
                 original.request["action"],
                 type(error).__name__,
                 address=original.address,
             ) from error
-        runtime_variant = VariantRecord(
-            current_variant.path,
-            current_variant.experiment,
-            original.snapshot["variant"],
-        )
-        selected = self._selected_for_request(original)
-        fallback = self._fallback_for_request(original, selected)
-        preflight = self._preflight(
-            python,
-            runtime_variant,
-            action=original.request["action"],
-            snapshot=original.snapshot,
-            selected=selected,
-            seed=original.request["exec"]["seed"],
-            device=original.request["exec"]["device"],
-            fallback=fallback,
-            target=original.request["target"],
-        )
-        fingerprint = self._action_fingerprint(
-            action=original.request["action"],
-            source_digest=current_digest,
-            selected=selected,
-            identity=preflight["identity"],
-            device=(
-                preflight["exec"]["device"]
-                if original.request["action"] == "train"
-                else None
-            ),
-        )
-        if (
-            fingerprint != original.request["identity_fingerprint"]
-            or preflight["exec"] != original.request["exec"]
-        ):
-            raise ContractError("retry preflight differs from the original Run")
-        experiment = ExperimentRecord(
-            self.repository.experiments / experiment_name,
-            original.snapshot["experiment"],
-        )
 
+    def _allocate_retry(
+        self,
+        original: RunRecord,
+        experiment: ExperimentRecord,
+        variant: VariantRecord,
+        *,
+        source_digest: str,
+        fingerprint: str,
+    ) -> RunRecord:
         def validate_retry(
             runs: list[RunRecord],
             models: list[ModelRecord],
@@ -585,49 +553,63 @@ class RunExecution:
             ):
                 raise LifecycleConflict(f"Run already has a retry: {original.address}")
 
-        retry = self.store.allocate(
+        return self.store.allocate(
             experiment,
-            runtime_variant,
+            variant,
             action=original.request["action"],
             target=original.request["target"],
             exec_info=original.request["exec"],
-            source_digest=current_digest,
+            source_digest=source_digest,
             identity_fingerprint=fingerprint,
             retry_of=original.request["run_id"],
             snapshot=original.snapshot,
             catalog_validator=validate_retry,
         )
+
+    def _execute_retry(
+        self,
+        original: RunRecord,
+        retry: RunRecord,
+        variant: VariantRecord,
+        *,
+        python: Path,
+        environment_descriptor: int,
+        selected: dict[str, str],
+        expected_identity: dict[str, Any],
+    ) -> RunRecord:
         if retry.request["action"] == "train":
-            resume_from = self._resume_checkpoint(original)
             return self._execute_train(
                 retry,
-                runtime_variant,
+                variant,
                 python=python,
+                environment_descriptor=environment_descriptor,
                 selected=selected,
-                expected_identity=preflight["identity"],
-                resume_from=resume_from,
+                expected_identity=expected_identity,
+                resume_from=self._resume_checkpoint(original),
             )
         model = self.store.load_model(
-            experiment_name,
-            variant_name,
+            retry.request["experiment"],
+            retry.request["variant"],
             retry.request["target"]["model_id"],
         )
         if retry.request["action"] == "eval":
             return self._execute_eval(
                 retry,
-                runtime_variant,
+                variant,
                 model,
                 python=python,
+                environment_descriptor=environment_descriptor,
                 selected=selected,
-                expected_identity=preflight["identity"],
+                expected_identity=expected_identity,
             )
         return self._execute_export(
             retry,
-            runtime_variant,
+            variant,
             model,
             python=python,
+            environment_descriptor=environment_descriptor,
             selected=selected,
-            expected_identity=preflight["identity"],
+            expected_identity=expected_identity,
         )
 
     def _prepare(
@@ -649,6 +631,7 @@ class RunExecution:
         python: Path,
         variant: VariantRecord,
         *,
+        environment_descriptor: int,
         action: str,
         snapshot: dict[str, Any],
         selected: dict[str, str],
@@ -667,30 +650,12 @@ class RunExecution:
             device=device,
             identity_fallback=deepcopy(fallback),
             runtime_target=deepcopy(target),
+            environment_descriptor=environment_descriptor,
         )
         identity = result.get("identity")
         if not isinstance(identity, dict):
             raise ContractError("Variant preflight identity is invalid")
         return {"exec": result["exec"], "identity": identity}
-
-    @staticmethod
-    def _action_fingerprint(
-        *,
-        action: str,
-        source_digest: str,
-        selected: Mapping[str, str],
-        identity: Mapping[str, Any],
-        device: str | None = None,
-    ) -> str:
-        payload: dict[str, Any] = {
-            "action": action,
-            "source_digest": source_digest,
-            "components": dict(selected),
-            "identity": dict(identity),
-        }
-        if action == "train":
-            payload["device"] = device
-        return fingerprint_document(payload)
 
     def _execute_train(
         self,
@@ -698,6 +663,7 @@ class RunExecution:
         variant: VariantRecord,
         *,
         python: Path,
+        environment_descriptor: int,
         selected: dict[str, str],
         expected_identity: dict[str, Any],
         resume_from: Path | None = None,
@@ -706,6 +672,7 @@ class RunExecution:
             record,
             variant,
             python=python,
+            environment_descriptor=environment_descriptor,
             selected=selected,
             expected_identity=expected_identity,
             resume_from=resume_from,
@@ -718,6 +685,7 @@ class RunExecution:
         model: ModelRecord,
         *,
         python: Path,
+        environment_descriptor: int,
         selected: dict[str, str],
         expected_identity: dict[str, Any],
     ) -> RunRecord:
@@ -725,6 +693,7 @@ class RunExecution:
             record,
             variant,
             python=python,
+            environment_descriptor=environment_descriptor,
             selected=selected,
             expected_identity=expected_identity,
             model=model,
@@ -737,6 +706,7 @@ class RunExecution:
         model: ModelRecord,
         *,
         python: Path,
+        environment_descriptor: int,
         selected: dict[str, str],
         expected_identity: dict[str, Any],
     ) -> RunRecord:
@@ -744,6 +714,7 @@ class RunExecution:
             record,
             variant,
             python=python,
+            environment_descriptor=environment_descriptor,
             selected=selected,
             expected_identity=expected_identity,
             model=model,
@@ -755,6 +726,7 @@ class RunExecution:
         variant: VariantRecord,
         *,
         python: Path,
+        environment_descriptor: int,
         selected: dict[str, str],
         expected_identity: dict[str, Any],
         model: ModelRecord | None = None,
@@ -773,60 +745,26 @@ class RunExecution:
                     python,
                     attempt_path,
                     lock_descriptor,
+                    environment_descriptor,
                 )
                 record = self.store.load(
                     record.request["experiment"],
                     record.request["variant"],
                     record.request["run_id"],
                 )
-                if action == "train":
-                    result = self.runtime.train(
-                        python,
-                        variant,
-                        cfg=record.snapshot,
-                        selected=selected,
-                        exec_info=record.request["exec"],
-                        run_dir=record.path,
-                        resume_from=resume_from,
-                        tracker_run_id=tracker_run_id,
-                        attempt_path=attempt_path,
-                        lock_descriptor=lock_descriptor,
-                        runtime_target=record.request["target"],
-                    )
-                elif action == "eval":
-                    if model is None:
-                        raise ContractError("Eval Run has no Model")
-                    result = self.runtime.evaluate(
-                        python,
-                        variant,
-                        cfg=record.snapshot,
-                        selected=selected,
-                        exec_info=record.request["exec"],
-                        run_dir=record.path,
-                        checkpoint=self.store.resolve_model_checkpoint(model),
-                        results_dir=candidate,
-                        tracker_run_id=tracker_run_id,
-                        attempt_path=attempt_path,
-                        lock_descriptor=lock_descriptor,
-                        runtime_target=record.request["target"],
-                    )
-                else:
-                    if model is None:
-                        raise ContractError("Export Run has no Model")
-                    result = self.runtime.export(
-                        python,
-                        variant,
-                        cfg=record.snapshot,
-                        selected=selected,
-                        exec_info=record.request["exec"],
-                        run_dir=record.path,
-                        export_dir=candidate,
-                        checkpoint=self.store.resolve_model_checkpoint(model),
-                        tracker_run_id=tracker_run_id,
-                        attempt_path=attempt_path,
-                        lock_descriptor=lock_descriptor,
-                        runtime_target=record.request["target"],
-                    )
+                result = self._invoke_action(
+                    record,
+                    variant,
+                    python=python,
+                    environment_descriptor=environment_descriptor,
+                    selected=selected,
+                    model=model,
+                    resume_from=resume_from,
+                    tracker_run_id=tracker_run_id,
+                    attempt_path=attempt_path,
+                    candidate=candidate,
+                    lock_descriptor=lock_descriptor,
+                )
                 self._record_worker_result(attempt_path, result)
                 self._verify_identity_after_execution(
                     record,
@@ -834,29 +772,25 @@ class RunExecution:
                     python=python,
                     selected=selected,
                     expected_identity=expected_identity,
+                    environment_descriptor=environment_descriptor,
                 )
-                if action == "eval":
-                    values = result.get("values")
-                    if not isinstance(values, dict):
-                        raise RuntimeFailure("Evaluator values must be a mapping")
-                    self.runtime.log_tracker_metrics(
-                        python,
-                        variant,
-                        tracker_run_id=tracker_run_id,
-                        values=values,
-                        lock_descriptor=lock_descriptor,
-                    )
-                completed = self._complete_from_journal(
-                    record,
-                    attempt_path,
-                    variant=variant,
+                self._log_evaluation_metrics(
+                    action,
+                    result,
+                    variant,
+                    python=python,
+                    tracker_run_id=tracker_run_id,
+                    lock_descriptor=lock_descriptor,
+                    environment_descriptor=environment_descriptor,
                 )
+                completed = self.receipts.complete_from_journal(record, attempt_path)
                 self.runtime.finish_tracker(
                     python,
                     variant,
                     tracker_run_id=tracker_run_id,
                     status="FINISHED",
                     lock_descriptor=lock_descriptor,
+                    environment_descriptor=environment_descriptor,
                 )
                 return completed
         except LockUnavailableError as error:
@@ -866,6 +800,7 @@ class RunExecution:
                 record,
                 variant,
                 python,
+                environment_descriptor,
                 status="interrupted",
                 reason="interrupted",
             )
@@ -875,6 +810,7 @@ class RunExecution:
                 record,
                 variant,
                 python,
+                environment_descriptor,
                 status="failed",
                 reason="TrackerOwnershipConflict",
             )
@@ -886,6 +822,7 @@ class RunExecution:
                 record,
                 variant,
                 python,
+                environment_descriptor,
                 status="failed",
                 reason=type(error).__name__,
             )
@@ -894,6 +831,84 @@ class RunExecution:
                 type(error).__name__,
                 address=record.address,
             ) from error
+
+    def _invoke_action(
+        self,
+        record: RunRecord,
+        variant: VariantRecord,
+        *,
+        python: Path,
+        environment_descriptor: int,
+        selected: dict[str, str],
+        model: ModelRecord | None,
+        resume_from: Path | None,
+        tracker_run_id: str | None,
+        attempt_path: Path,
+        candidate: Path,
+        lock_descriptor: int,
+    ) -> dict[str, Any]:
+        action = record.request["action"]
+        common = {
+            "cfg": record.snapshot,
+            "selected": selected,
+            "exec_info": record.request["exec"],
+            "run_dir": record.path,
+            "tracker_run_id": tracker_run_id,
+            "attempt_path": attempt_path,
+            "lock_descriptor": lock_descriptor,
+            "runtime_target": record.request["target"],
+            "environment_descriptor": environment_descriptor,
+        }
+        if action == "train":
+            return self.runtime.train(
+                python,
+                variant,
+                resume_from=resume_from,
+                **common,
+            )
+        if model is None:
+            raise ContractError(f"{action.title()} Run has no Model")
+        checkpoint = self.store.resolve_model_checkpoint(model)
+        if action == "eval":
+            return self.runtime.evaluate(
+                python,
+                variant,
+                checkpoint=checkpoint,
+                results_dir=candidate,
+                **common,
+            )
+        return self.runtime.export(
+            python,
+            variant,
+            export_dir=candidate,
+            checkpoint=checkpoint,
+            **common,
+        )
+
+    def _log_evaluation_metrics(
+        self,
+        action: str,
+        result: dict[str, Any],
+        variant: VariantRecord,
+        *,
+        python: Path,
+        tracker_run_id: str | None,
+        lock_descriptor: int,
+        environment_descriptor: int,
+    ) -> None:
+        if action != "eval":
+            return
+        values = result.get("values")
+        if not isinstance(values, dict):
+            raise RuntimeFailure("Evaluator values must be a mapping")
+        self.runtime.log_tracker_metrics(
+            python,
+            variant,
+            tracker_run_id=tracker_run_id,
+            values=values,
+            lock_descriptor=lock_descriptor,
+            environment_descriptor=environment_descriptor,
+        )
 
     def _start_attempt(
         self,
@@ -949,6 +964,7 @@ class RunExecution:
         python: Path,
         attempt_path: Path,
         lock_descriptor: int,
+        environment_descriptor: int,
     ) -> str | None:
         tracker_run_id = record.state["tracker_run_id"]
         if "mlflow" in validate_tracker(record.snapshot["variant"]["tracker"]):
@@ -969,6 +985,7 @@ class RunExecution:
                 current_tracker_run_id=tracker_run_id,
                 lock_descriptor=lock_descriptor,
                 metadata=metadata,
+                environment_descriptor=environment_descriptor,
             )
             record = self.store.update_state(
                 record,
@@ -987,6 +1004,7 @@ class RunExecution:
         variant: VariantRecord,
         *,
         python: Path,
+        environment_descriptor: int,
         selected: dict[str, str],
         expected_identity: dict[str, Any],
     ) -> None:
@@ -1003,8 +1021,9 @@ class RunExecution:
             selected=selected,
             seed=record.request["exec"]["seed"],
             device=record.request["exec"]["device"],
-            fallback=self._fallback_for_request(record, selected),
+            fallback=fallback_for_request(record, selected),
             target=record.request["target"],
+            environment_descriptor=environment_descriptor,
         )
         if (
             result["exec"] != record.request["exec"]
@@ -1012,250 +1031,12 @@ class RunExecution:
         ):
             raise RuntimeFailure("Variant action identity changed during execution")
 
-    def _complete_from_journal(
-        self,
-        record: RunRecord,
-        attempt_path: Path,
-        *,
-        variant: VariantRecord,
-    ) -> RunRecord:
-        journal = load_attempt(attempt_path)
-        if journal is None or journal["phase"] not in {"worker_done", "ready"}:
-            raise ContractError("attempt journal has no durable worker result")
-        if journal["action"] == "train":
-            return self._complete_train(record, journal, attempt_path)
-        if journal["action"] == "eval":
-            return self._complete_eval(record, journal, attempt_path)
-        return self._complete_export(record, journal, attempt_path)
-
-    def _complete_train(
-        self,
-        record: RunRecord,
-        journal: dict[str, Any],
-        attempt_path: Path,
-    ) -> RunRecord:
-        result = journal["result"]
-        if journal["phase"] == "worker_done":
-            best = self._checkpoint_result(record, result.get("best_checkpoint"))
-            last = self._checkpoint_result(record, result.get("last_checkpoint"))
-            digests = {
-                best: _file_digest(record.path / best),
-                last: _file_digest(record.path / last),
-            }
-            metric_files = result.get("metrics")
-            metric_digests = self.store.validate_completed_training_metrics(
-                record,
-                metric_files,
-            )
-        else:
-            best = result.get("best_checkpoint")
-            last = result.get("last_checkpoint")
-            digests = result.get("digests")
-            metric_files = result.get("metrics")
-            metric_digests = result.get("metric_digests")
-            if (
-                not isinstance(best, str)
-                or not isinstance(last, str)
-                or journal["checkpoint"] != {"best": best, "last": last}
-                or not isinstance(digests, dict)
-                or set(digests) != {best, last}
-                or not isinstance(metric_digests, dict)
-            ):
-                raise ContractError("Train receipt is invalid")
-            for relative in {best, last}:
-                try:
-                    validated = self._checkpoint_result(
-                        record,
-                        str(record.path / relative),
-                    )
-                except RuntimeFailure as error:
-                    raise ContractError(
-                        "Train receipt checkpoint is invalid"
-                    ) from error
-                if validated != relative or digests[relative] != _file_digest(
-                    record.path / relative
-                ):
-                    raise ContractError("Train receipt checkpoint changed")
-            current_metric_digests = self.store.validate_completed_training_metrics(
-                record,
-                metric_files,
-            )
-            if metric_digests != current_metric_digests:
-                raise ContractError("Train receipt metric files changed")
-        best_digest = digests[best]
-        models = [
-            model
-            for model in self.store.scan_models(
-                experiment=record.request["experiment"],
-                variant=record.request["variant"],
-            )
-            if model.document["producer_run"] == record.request["run_id"]
-        ]
-        if len(models) > 1:
-            raise ContractError("Train Run produced multiple Models")
-        if models:
-            model = models[0]
-            if (
-                model.document["checkpoint"]["path"]
-                != f"runs/{record.request['run_id']}/{best}"
-                or model.document["checkpoint"]["digest"] != best_digest
-            ):
-                raise ContractError("published Model disagrees with Train receipt")
-        else:
-            if journal["phase"] == "ready":
-                raise ContractError("ready Train receipt has no Model")
-            model = self.store.allocate_model(
-                record,
-                checkpoint=best,
-                checkpoint_digest=best_digest,
-            )
-        if journal["phase"] == "ready":
-            if result.get("model_id") != model.document["model_id"]:
-                raise ContractError("Train receipt Model disagrees with publication")
-        else:
-            journal["phase"] = "ready"
-            journal["checkpoint"] = {"best": best, "last": last}
-            journal["result"] = {
-                "model_id": model.document["model_id"],
-                "best_checkpoint": best,
-                "last_checkpoint": last,
-                "digests": digests,
-                "metrics": metric_files,
-                "metric_digests": metric_digests,
-            }
-            write_attempt(attempt_path, journal)
-        record = self.store.update_state(
-            record,
-            status="done",
-            result={"model_id": model.document["model_id"]},
-            best_checkpoint=best,
-            last_checkpoint=last,
-        )
-        remove_attempt(attempt_path)
-        return record
-
-    def _complete_eval(
-        self,
-        record: RunRecord,
-        journal: dict[str, Any],
-        attempt_path: Path,
-    ) -> RunRecord:
-        candidate_value = journal["candidate"]
-        if not isinstance(candidate_value, str):
-            raise ContractError("Eval receipt candidate is invalid")
-        candidate = record.path / candidate_value
-        final_results = record.path / "artifacts/results"
-        final_metrics = record.path / "metrics/eval.json"
-        if journal["phase"] == "worker_done":
-            files = self._validate_candidate_files(
-                candidate,
-                journal["result"].get("files"),
-            )
-            artifacts = [f"artifacts/results/{relative}" for relative in files]
-            values = journal["result"].get("values")
-            if not isinstance(values, dict):
-                raise RuntimeFailure("Evaluator values must be a mapping")
-            document = self.store.evaluation_document(
-                record,
-                values=values,
-                artifacts=artifacts,
-            )
-            metrics_candidate = record.path / "metrics/.eval.candidate.json"
-            atomic_write_new(metrics_candidate, self.store.json_text(document))
-            journal["phase"] = "ready"
-            journal["result"] = {
-                "document": document,
-                "metrics_digest": _file_digest(metrics_candidate),
-                "files": [
-                    {"path": relative, "digest": _file_digest(candidate / relative)}
-                    for relative in files
-                ],
-            }
-            write_attempt(attempt_path, journal)
-        document = journal["result"].get("document")
-        files = journal["result"].get("files")
-        if not isinstance(document, dict) or not isinstance(files, list):
-            raise ContractError("Eval receipt is invalid")
-        metrics_candidate = record.path / "metrics/.eval.candidate.json"
-        if files:
-            self._publish_or_verify_directory(candidate, final_results, files)
-        elif candidate.exists():
-            candidate.rmdir()
-        self._publish_or_verify_file(
-            metrics_candidate,
-            final_metrics,
-            self.store.json_text(document).encode("utf-8"),
-        )
-        record = self.store.update_state(
-            record,
-            status="done",
-            result={"metrics": "metrics/eval.json"},
-        )
-        remove_attempt(attempt_path)
-        return record
-
-    def _complete_export(
-        self,
-        record: RunRecord,
-        journal: dict[str, Any],
-        attempt_path: Path,
-    ) -> RunRecord:
-        candidate_value = journal["candidate"]
-        if not isinstance(candidate_value, str):
-            raise ContractError("Export receipt candidate is invalid")
-        candidate = record.path / candidate_value
-        final = record.path / "artifacts/export"
-        if journal["phase"] == "worker_done":
-            paths = self._validate_candidate_files(
-                candidate,
-                journal["result"].get("files"),
-                require_nonempty=True,
-            )
-            journal["phase"] = "ready"
-            journal["result"] = {
-                "files": [
-                    {"path": relative, "digest": _file_digest(candidate / relative)}
-                    for relative in paths
-                ]
-            }
-            write_attempt(attempt_path, journal)
-        files = journal["result"].get("files")
-        if not isinstance(files, list) or not files:
-            raise ContractError("Export receipt is invalid")
-        self._publish_or_verify_directory(candidate, final, files)
-        record = self.store.update_state(
-            record,
-            status="done",
-            result={"export": "artifacts/export"},
-        )
-        remove_attempt(attempt_path)
-        return record
-
-    def _commit_receipt(
-        self,
-        record: RunRecord,
-        journal: dict[str, Any],
-    ) -> RunRecord:
-        current_variant = self.authoring.check_variant(
-            record.request["experiment"],
-            record.request["variant"],
-        )
-        if (
-            compute_source_digest(current_variant.path / "src")
-            != record.request["source_digest"]
-        ):
-            raise ContractError("Variant source changed since the original Run")
-        return self._complete_from_journal(
-            record,
-            record.path / ".attempt.json",
-            variant=current_variant,
-        )
-
     def _stop_attempt(
         self,
         record: RunRecord,
         variant: VariantRecord,
         python: Path,
+        environment_descriptor: int,
         *,
         status: str,
         reason: str,
@@ -1274,35 +1055,43 @@ class RunExecution:
         journal = load_attempt(attempt_path)
         if journal is not None and journal["phase"] == "ready":
             return
-        changes: dict[str, Any] = {
-            "status": status,
-            "reason": reason,
-        }
-        if journal is not None and journal["action"] == "train":
-            checkpoint = journal["checkpoint"]
-            if checkpoint["best"] is not None:
-                changes["best_checkpoint"] = checkpoint["best"]
-            if checkpoint["last"] is not None:
-                changes["last_checkpoint"] = checkpoint["last"]
-        current = self.store.update_state(current, **changes)
-        if journal is not None and journal["candidate"] is not None:
-            candidate = current.path / journal["candidate"]
-            if candidate.exists() and not candidate.is_symlink():
-                shutil.rmtree(candidate)
+        current = self.store.update_state(
+            current,
+            **_stopped_state_changes(journal, status, reason),
+        )
+        _remove_attempt_candidate(current, journal)
         remove_attempt(attempt_path)
-        tracker = current.state["tracker_run_id"]
-        if tracker is not None:
-            try:
-                with try_directory_lock(current.path) as descriptor:
-                    self.runtime.finish_tracker(
-                        python,
-                        variant,
-                        tracker_run_id=tracker,
-                        status="KILLED" if status == "interrupted" else "FAILED",
-                        lock_descriptor=descriptor,
-                    )
-            except Exception:
-                pass
+        self._finish_stopped_tracker(
+            current,
+            variant,
+            python,
+            environment_descriptor,
+            status,
+        )
+
+    def _finish_stopped_tracker(
+        self,
+        record: RunRecord,
+        variant: VariantRecord,
+        python: Path,
+        environment_descriptor: int,
+        status: str,
+    ) -> None:
+        tracker = record.state["tracker_run_id"]
+        if tracker is None:
+            return
+        try:
+            with try_directory_lock(record.path) as descriptor:
+                self.runtime.finish_tracker(
+                    python,
+                    variant,
+                    tracker_run_id=tracker,
+                    status="KILLED" if status == "interrupted" else "FAILED",
+                    lock_descriptor=descriptor,
+                    environment_descriptor=environment_descriptor,
+                )
+        except Exception:
+            pass
 
     def _record_worker_result(
         self,
@@ -1319,22 +1108,6 @@ class RunExecution:
         elif journal["phase"] != "worker_done":
             raise ContractError("attempt journal phase is invalid")
 
-    def _checkpoint_result(self, record: RunRecord, value: Any) -> str:
-        if not isinstance(value, str):
-            raise RuntimeFailure("Trainer checkpoint result must be a path")
-        path = Path(value)
-        if not path.is_absolute():
-            raise RuntimeFailure("Trainer checkpoint result must be absolute")
-        try:
-            relative = path.relative_to(record.path)
-            resolved = path.resolve(strict=True)
-            resolved.relative_to((record.path / "artifacts/checkpoints").resolve())
-        except (OSError, ValueError) as error:
-            raise RuntimeFailure("Trainer checkpoint is outside its root") from error
-        if path.is_symlink() or not path.is_file():
-            raise RuntimeFailure("Trainer checkpoint must be a regular file")
-        return relative.as_posix()
-
     def _resume_checkpoint(self, record: RunRecord) -> Path | None:
         relative = record.state["last_checkpoint"]
         if relative is None:
@@ -1350,40 +1123,6 @@ class RunExecution:
             raise ContractError("retry checkpoint is outside its root") from error
         return path.resolve()
 
-    def _selected_for_request(self, record: RunRecord) -> dict[str, str]:
-        experiment = record.snapshot["experiment"]
-        variant = record.snapshot["variant"]
-        if record.request["action"] == "train":
-            return validate_training_readiness(experiment, variant)
-        if record.request["action"] == "eval":
-            return validate_evaluation_readiness(
-                experiment,
-                variant,
-                case=record.request["target"]["evaluation_case"],
-            )
-        return validate_export_readiness(experiment, variant)
-
-    def _fallback_for_request(
-        self,
-        record: RunRecord,
-        selected: Mapping[str, str],
-    ) -> dict[str, Any]:
-        variant = record.snapshot["variant"]
-        if record.request["action"] == "train":
-            return {
-                "dataset": variant["dataset"],
-                "train": variant["train"],
-                "components": dict(selected),
-            }
-        if record.request["action"] == "eval":
-            case = record.request["target"]["evaluation_case"]
-            return {
-                "case": evaluation_case(variant, case),
-                "metrics": metric_spec(variant, case),
-                "components": dict(selected),
-            }
-        return {"infer": variant["infer"], "components": dict(selected)}
-
     def _evaluation_exists(
         self,
         experiment: str,
@@ -1398,125 +1137,79 @@ class RunExecution:
             for record in self.store.scan(experiment=experiment, variant=variant)
         )
 
-    @staticmethod
-    def _validate_candidate_files(
-        candidate: Path,
-        returned: Any,
+    def _evaluation_models(
+        self,
+        experiment: str,
+        variant: str,
+        training_group: str,
+        seed: int | str | None,
+    ) -> list[ModelRecord]:
+        models = [
+            model
+            for model in self.store.scan_models(experiment=experiment, variant=variant)
+            if model.document["training_group"] == training_group
+        ]
+        if not models:
+            raise LifecycleConflict(f"Training Group has no Models: {training_group}")
+        if seed is None and len(models) != 1:
+            raise LifecycleConflict(
+                f"Training Group has multiple Models; specify --seed: {training_group}"
+            )
+        if seed not in {None, "all"}:
+            models = [model for model in models if model.document["seed"] == seed]
+            if not models:
+                raise LifecycleConflict(
+                    f"Training Group seed has no Model: {training_group}/{seed}"
+                )
+        return sorted(models, key=lambda item: item.document["seed"])
+
+    def _skip_existing_evaluation(
+        self,
+        experiment: str,
+        variant: str,
+        model_id: str,
+        case: str,
         *,
-        require_nonempty: bool = False,
-    ) -> list[str]:
-        if not isinstance(returned, list) or any(
-            not isinstance(value, str) for value in returned
-        ):
-            raise RuntimeFailure("worker file result must be a list of paths")
-        if require_nonempty and not returned:
-            raise RuntimeFailure("worker file result must not be empty")
-        if len(returned) != len(set(returned)):
-            raise RuntimeFailure("worker file result contains duplicates")
-        expected: set[str] = set()
-        for raw in returned:
-            path = Path(raw)
-            if not path.is_absolute():
-                raise RuntimeFailure("worker file result must be absolute")
-            try:
-                relative = path.relative_to(candidate)
-                resolved = path.resolve(strict=True)
-                resolved.relative_to(candidate.resolve(strict=True))
-            except (OSError, ValueError) as error:
-                raise RuntimeFailure(
-                    "worker file result is outside candidate"
-                ) from error
-            if path.is_symlink() or not path.is_file():
-                raise RuntimeFailure("worker file result must be a regular file")
-            expected.add(relative.as_posix())
-        actual = set(_candidate_files(candidate))
-        if actual != expected:
-            raise RuntimeFailure("worker file result does not match candidate files")
-        return sorted(actual, key=lambda value: value.encode("utf-8"))
-
-    @staticmethod
-    def _publish_or_verify_file(
-        candidate: Path,
-        final: Path,
-        expected: bytes,
-    ) -> None:
-        if os.path.lexists(final):
-            if (
-                final.is_symlink()
-                or not final.is_file()
-                or final.read_bytes() != expected
-            ):
-                raise ContractError("published file disagrees with receipt")
-            candidate.unlink(missing_ok=True)
-            return
-        if not candidate.is_file() or candidate.is_symlink():
-            raise ContractError("receipt candidate file is unavailable")
-        if candidate.read_bytes() != expected:
-            raise ContractError("receipt candidate file changed")
-        publish_file(candidate, final)
-
-    @staticmethod
-    def _publish_or_verify_directory(
-        candidate: Path,
-        final: Path,
-        files: Sequence[Mapping[str, Any]],
-    ) -> None:
-        expected = {
-            item["path"]: item["digest"]
-            for item in files
-            if isinstance(item, Mapping)
-            and isinstance(item.get("path"), str)
-            and isinstance(item.get("digest"), str)
-        }
-        if len(expected) != len(files):
-            raise ContractError("directory receipt is invalid")
-        if os.path.lexists(final):
-            if final.is_symlink() or not final.is_dir():
-                raise ContractError("published directory is invalid")
-            actual = {
-                relative: _file_digest(final / relative)
-                for relative in _candidate_files(final)
-            }
-            if actual != expected:
-                raise ContractError("published directory disagrees with receipt")
-            if candidate.exists():
-                shutil.rmtree(candidate)
-            return
-        actual = {
-            relative: _file_digest(candidate / relative)
-            for relative in _candidate_files(candidate)
-        }
-        if actual != expected:
-            raise ContractError("candidate directory disagrees with receipt")
-        publish_directory(candidate, final)
+        allow_skip: bool,
+    ) -> bool:
+        if not self._evaluation_exists(experiment, variant, model_id, case):
+            return False
+        if allow_skip:
+            return True
+        raise LifecycleConflict("Model and Evaluation Case already have an execution")
 
 
-def _candidate_files(root: Path) -> list[str]:
-    if root.is_symlink() or not root.is_dir():
-        raise ContractError("candidate directory is invalid")
-    files: list[str] = []
-    for directory, directories, filenames in os.walk(root, followlinks=False):
-        directory_path = Path(directory)
-        for name in directories:
-            path = directory_path / name
-            if path.is_symlink():
-                raise ContractError("candidate contains a symlink")
-        for name in filenames:
-            path = directory_path / name
-            try:
-                mode = path.lstat().st_mode
-            except OSError as error:
-                raise ContractError("candidate file is unavailable") from error
-            if path.is_symlink() or not stat.S_ISREG(mode):
-                raise ContractError("candidate contains a non-regular file")
-            files.append(path.relative_to(root).as_posix())
-    return sorted(files, key=lambda value: value.encode("utf-8"))
+def _retry_checkpoint_changes(journal: dict[str, Any] | None) -> dict[str, Any]:
+    if journal is None or journal["action"] != "train":
+        return {}
+    checkpoint = journal["checkpoint"]
+    changes: dict[str, Any] = {}
+    if checkpoint["best"] is not None:
+        changes["best_checkpoint"] = checkpoint["best"]
+    if checkpoint["last"] is not None:
+        changes["last_checkpoint"] = checkpoint["last"]
+    return changes
 
 
-def _file_digest(path: Path) -> str:
-    if path.is_symlink() or not path.is_file():
-        raise ContractError("artifact must be a regular file")
-    return f"sha256:{hashlib.sha256(path.read_bytes()).hexdigest()}"
+def _stopped_state_changes(
+    journal: dict[str, Any] | None,
+    status: str,
+    reason: str,
+) -> dict[str, Any]:
+    changes = {"status": status, "reason": reason}
+    changes.update(_retry_checkpoint_changes(journal))
+    return changes
+
+
+def _remove_attempt_candidate(
+    record: RunRecord,
+    journal: dict[str, Any] | None,
+) -> None:
+    if journal is None or journal["candidate"] is None:
+        return
+    candidate = record.path / journal["candidate"]
+    if candidate.exists() and not candidate.is_symlink():
+        shutil.rmtree(candidate)
 
 
 __all__ = [

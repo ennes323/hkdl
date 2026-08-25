@@ -42,8 +42,10 @@ from .environments import EnvironmentFailure, EnvironmentStore, PrunePlan
 from .export import Export, ExportFailure, ExportInterrupted
 from .migration import Migration
 from .recovery import Recovery, RecoveryFailure, RecoveryInterrupted
-from .runs import MAX_SEED, TERMINAL_STATUSES, RunRecord, RunStore
+from .run_contracts import MAX_SEED, TERMINAL_STATUSES
+from .runs import RunRecord, RunStore
 from .status import Status, render_status_tree
+from .status_index import IndexFailure, IndexReport
 from .storage import (
     AlreadyExistsError,
     NotFoundError,
@@ -122,6 +124,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     except EnvironmentFailure as error:
         print(f"error: environment operation failed: {error}", file=sys.stderr)
         return 6
+    except IndexFailure as error:
+        print(f"error: index operation failed: {error}", file=sys.stderr)
+        return 6
 
 
 def _dispatch(args: argparse.Namespace) -> int:
@@ -149,6 +154,13 @@ def _dispatch(args: argparse.Namespace) -> int:
                     for category, size in usage.items()
                 ),
             )
+        return 0
+    if args.noun == "index":
+        status = Status(repository)
+        if args.verb == "status":
+            _index_report(status.index_status())
+        else:
+            _index_report(status.rebuild_index())
         return 0
 
     authoring = Authoring(repository)
@@ -448,7 +460,7 @@ def _dispatch(args: argparse.Namespace) -> int:
         return 0
 
     if (args.noun, args.verb) == ("model", "list"):
-        models = RunStore(authoring.repository).scan_models(
+        models = RunStore(authoring.repository).scan_model_manifests(
             experiment=args.experiment,
             variant=args.variant,
         )
@@ -487,7 +499,7 @@ def _dispatch(args: argparse.Namespace) -> int:
         return 0
 
     if (args.noun, args.verb) == ("model", "show"):
-        model = RunStore(authoring.repository).load_model(
+        model = RunStore(authoring.repository).load_model_manifest(
             args.experiment,
             args.variant,
             args.model_id,
@@ -910,6 +922,33 @@ def _parser() -> argparse.ArgumentParser:
     storage.set_defaults(verb=None)
     _output_argument(storage)
 
+    index = nouns.add_parser(
+        "index",
+        help="Inspect and rebuild the status projection",
+        description="Inspect and rebuild the disposable SQLite status projection.",
+    )
+    index_verbs = index.add_subparsers(
+        title="commands",
+        dest="verb",
+        required=True,
+    )
+    index_status = index_verbs.add_parser(
+        "status",
+        help="Inspect projection health without changing it",
+        description="Inspect the disposable status projection without changing it.",
+        epilog=_examples("hkdl index status"),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    index_status.set_defaults(verb="status")
+    index_rebuild = index_verbs.add_parser(
+        "rebuild",
+        help="Rebuild the projection from authoritative files",
+        description="Validate authoritative files and atomically rebuild the projection.",
+        epilog=_examples("hkdl index rebuild"),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    index_rebuild.set_defaults(verb="rebuild")
+
     environment = nouns.add_parser(
         "environment",
         help="Manage generated Variant environments",
@@ -1005,6 +1044,20 @@ def _parser() -> argparse.ArgumentParser:
 
 def _examples(*commands: str) -> str:
     return "examples:\n" + "\n".join(f"  {command}" for command in commands)
+
+
+def _index_report(report: IndexReport) -> None:
+    print(f"state: {report.state}")
+    print(f"path: {report.path}")
+    print(
+        "schema: "
+        + ("-" if report.schema_version is None else str(report.schema_version))
+    )
+    print(f"variants: {report.variants}")
+    print(f"runs: {report.runs}")
+    print(f"models: {report.models}")
+    if report.detail is not None:
+        print(f"detail: {report.detail}")
 
 
 def _experiment_argument(

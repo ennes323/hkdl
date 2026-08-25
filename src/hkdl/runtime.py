@@ -15,7 +15,16 @@ from typing import Any
 from .authoring import VariantRecord
 from .config import ContractError
 from .environments import EnvironmentFailure, EnvironmentHandle, EnvironmentStore
-from .runs import validate_tracker
+from .run_contracts import validate_tracker
+from .runtime_requests import (
+    build_evaluate_request,
+    build_export_request,
+    build_tracker_finish_request,
+    build_tracker_metrics_request,
+    build_tracker_request,
+    build_train_request,
+    build_validate_request,
+)
 from .storage import RepositoryPaths, validate_repository_root
 
 
@@ -84,27 +93,19 @@ class VariantRuntime:
         runtime_target: dict[str, Any] | None = None,
         environment_descriptor: int | None = None,
     ) -> dict[str, Any]:
-        runtime_cfg = dict(cfg)
-        runtime_cfg["runtime"] = {
-            "action": action,
-            "target": runtime_target or {},
-        }
         result = self._invoke(
             python,
             variant,
-            {
-                "operation": "validate",
-                "action": action,
-                "source": str(variant.path / "src"),
-                "cfg": runtime_cfg,
-                "selected": selected,
-                "exec": {"seed": seed, "device": device},
-                "identity_fallback": identity_fallback or {},
-                "repository_root": str(variant.path.parents[2]),
-                "tracker_backends": list(
-                    validate_tracker(runtime_cfg["variant"]["tracker"])
-                ),
-            },
+            build_validate_request(
+                variant,
+                action=action,
+                cfg=cfg,
+                selected=selected,
+                seed=seed,
+                device=device,
+                identity_fallback=identity_fallback,
+                runtime_target=runtime_target,
+            ),
             environment_descriptor=environment_descriptor,
         )
         if result.get("status") == "contract_error":
@@ -130,32 +131,20 @@ class VariantRuntime:
         runtime_target: dict[str, Any] | None = None,
         environment_descriptor: int | None = None,
     ) -> dict[str, Any]:
-        runtime_cfg = dict(cfg)
-        runtime_cfg["runtime"] = {
-            "action": "train",
-            "target": runtime_target or {},
-        }
         result = self._invoke(
             python,
             variant,
-            {
-                "operation": "train",
-                "action": "train",
-                "source": str(variant.path / "src"),
-                "cfg": runtime_cfg,
-                "selected": selected,
-                "exec": exec_info,
-                "run_dir": str(run_dir),
-                "resume_from": str(resume_from) if resume_from is not None else None,
-                "tracker_run_id": tracker_run_id,
-                "attempt_path": (
-                    str(attempt_path) if attempt_path is not None else None
-                ),
-                "repository_root": str(variant.path.parents[2]),
-                "tracker_backends": list(
-                    validate_tracker(runtime_cfg["variant"]["tracker"])
-                ),
-            },
+            build_train_request(
+                variant,
+                cfg=cfg,
+                selected=selected,
+                exec_info=exec_info,
+                run_dir=run_dir,
+                resume_from=resume_from,
+                tracker_run_id=tracker_run_id,
+                attempt_path=attempt_path,
+                runtime_target=runtime_target,
+            ),
             lock_descriptor=lock_descriptor,
             environment_descriptor=environment_descriptor,
             log_path=run_dir / "worker.log",
@@ -179,36 +168,21 @@ class VariantRuntime:
         runtime_target: dict[str, Any] | None = None,
         environment_descriptor: int | None = None,
     ) -> dict[str, Any]:
-        runtime_cfg = dict(cfg)
-        runtime_cfg["runtime"] = {
-            "action": "eval",
-            "target": runtime_target or {},
-        }
         result = self._invoke(
             python,
             variant,
-            {
-                "operation": "evaluate",
-                "action": "eval",
-                "source": str(variant.path / "src"),
-                "cfg": runtime_cfg,
-                "selected": selected,
-                "exec": exec_info,
-                "run_dir": str(run_dir),
-                "checkpoint": str(checkpoint),
-                "results_dir": str(
-                    results_dir
-                    if results_dir is not None
-                    else run_dir / "artifacts/results"
-                ),
-                "tracker_run_id": tracker_run_id,
-                "attempt_path": (
-                    str(attempt_path) if attempt_path is not None else None
-                ),
-                "tracker_backends": list(
-                    validate_tracker(runtime_cfg["variant"]["tracker"])
-                ),
-            },
+            build_evaluate_request(
+                variant,
+                cfg=cfg,
+                selected=selected,
+                exec_info=exec_info,
+                run_dir=run_dir,
+                checkpoint=checkpoint,
+                results_dir=results_dir,
+                tracker_run_id=tracker_run_id,
+                attempt_path=attempt_path,
+                runtime_target=runtime_target,
+            ),
             lock_descriptor=lock_descriptor,
             environment_descriptor=environment_descriptor,
             log_path=run_dir / "worker.log",
@@ -232,32 +206,21 @@ class VariantRuntime:
         runtime_target: dict[str, Any] | None = None,
         environment_descriptor: int | None = None,
     ) -> dict[str, Any]:
-        runtime_cfg = dict(cfg)
-        runtime_cfg["runtime"] = {
-            "action": "export",
-            "target": runtime_target or {},
-        }
         result = self._invoke(
             python,
             variant,
-            {
-                "operation": "export",
-                "action": "export",
-                "source": str(variant.path / "src"),
-                "cfg": runtime_cfg,
-                "selected": selected,
-                "exec": exec_info,
-                "run_dir": str(run_dir),
-                "export_dir": str(export_dir),
-                "checkpoint": str(checkpoint),
-                "tracker_run_id": tracker_run_id,
-                "attempt_path": (
-                    str(attempt_path) if attempt_path is not None else None
-                ),
-                "tracker_backends": list(
-                    validate_tracker(runtime_cfg["variant"]["tracker"])
-                ),
-            },
+            build_export_request(
+                variant,
+                cfg=cfg,
+                selected=selected,
+                exec_info=exec_info,
+                run_dir=run_dir,
+                export_dir=export_dir,
+                checkpoint=checkpoint,
+                tracker_run_id=tracker_run_id,
+                attempt_path=attempt_path,
+                runtime_target=runtime_target,
+            ),
             lock_descriptor=lock_descriptor,
             environment_descriptor=environment_descriptor,
             log_path=run_dir / "worker.log",
@@ -282,16 +245,14 @@ class VariantRuntime:
         result = self._invoke(
             python,
             variant,
-            {
-                "operation": "tracker",
-                "source": str(variant.path / "src"),
-                "cfg": cfg,
-                "run_dir": str(run_dir),
-                "repository_root": str(variant.path.parents[2]),
-                "current_tracker_run_id": current_tracker_run_id,
-                "metadata": metadata,
-                "tracker_backends": list(tracker_backends),
-            },
+            build_tracker_request(
+                variant,
+                cfg=cfg,
+                run_dir=run_dir,
+                current_tracker_run_id=current_tracker_run_id,
+                metadata=metadata,
+                tracker_backends=tracker_backends,
+            ),
             lock_descriptor=lock_descriptor,
             environment_descriptor=environment_descriptor,
         )
@@ -316,12 +277,11 @@ class VariantRuntime:
         self._successful_operation(
             python,
             variant,
-            {
-                "operation": "tracker_metrics",
-                "tracker_run_id": tracker_run_id,
-                "values": values,
-                "repository_root": str(variant.path.parents[2]),
-            },
+            build_tracker_metrics_request(
+                variant,
+                tracker_run_id=tracker_run_id,
+                values=values,
+            ),
             lock_descriptor=lock_descriptor,
             environment_descriptor=environment_descriptor,
         )
@@ -341,12 +301,11 @@ class VariantRuntime:
         self._successful_operation(
             python,
             variant,
-            {
-                "operation": "tracker_finish",
-                "tracker_run_id": tracker_run_id,
-                "run_status": status,
-                "repository_root": str(variant.path.parents[2]),
-            },
+            build_tracker_finish_request(
+                variant,
+                tracker_run_id=tracker_run_id,
+                status=status,
+            ),
             lock_descriptor=lock_descriptor,
             environment_descriptor=environment_descriptor,
         )

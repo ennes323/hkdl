@@ -130,9 +130,13 @@ def _require_public_checkout(root: Path) -> None:
     )
     if public_files.returncode:
         raise ContractError("hkdl update requires a public HKDL source checkout")
+    if _git(root, "ls-files", "--error-unmatch", "AGENTS.user.md").returncode == 0:
+        raise ContractError("public HKDL must not track user-owned AGENTS.user.md")
 
 
 def _require_public_target(root: Path) -> None:
+    if not _git(root, "cat-file", "-e", "FETCH_HEAD:AGENTS.user.md").returncode:
+        raise ContractError("origin/main must not track user-owned AGENTS.user.md")
     for path in (
         "setup.sh",
         "AGENTS.md",
@@ -178,6 +182,7 @@ def _show_update(
         "  - bundled Templates\n"
         "  - public documentation and setup files\n\n"
         "Will preserve:\n"
+        "  - AGENTS.user.md\n"
         "  - experiments/\n"
         "  - outputs/\n"
         "  - existing Variant source and environments\n\n"

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import fcntl
 import hashlib
 import os
 import stat
@@ -22,6 +21,8 @@ from .config import (
     validate_template_manifest,
     validate_template_variant_seed,
 )
+from .filesystem import lock_directory as _raw_lock_directory
+from .filesystem import unlock_directory as _raw_unlock_directory
 
 
 class AlreadyExistsError(ContractError):
@@ -38,6 +39,9 @@ class OwnershipError(ContractError):
 
 class LockUnavailableError(RuntimeError):
     """A non-blocking advisory lock is already held."""
+
+
+STATUS_INDEX_FILENAME = ".hkdl-index.sqlite3"
 
 
 @dataclass(frozen=True)
@@ -66,7 +70,10 @@ def storage_usage(repository: RepositoryPaths) -> dict[str, int]:
     )
     shared_environments, _ = _tree_sizes(repository.root / ".hkdl/environments")
     environments = legacy_environments + shared_environments
-    outputs, _ = _tree_sizes(repository.outputs)
+    outputs, _ = _tree_sizes(
+        repository.outputs,
+        ignored_root_prefixes=(STATUS_INDEX_FILENAME,),
+    )
     return {
         "authored": authored,
         "environments": environments,
@@ -75,7 +82,12 @@ def storage_usage(repository: RepositoryPaths) -> dict[str, int]:
     }
 
 
-def _tree_sizes(root: Path, *, split_environments: bool = False) -> tuple[int, int]:
+def _tree_sizes(
+    root: Path,
+    *,
+    split_environments: bool = False,
+    ignored_root_prefixes: tuple[str, ...] = (),
+) -> tuple[int, int]:
     try:
         root_stat = root.lstat()
     except FileNotFoundError:
@@ -97,6 +109,8 @@ def _tree_sizes(root: Path, *, split_environments: bool = False) -> tuple[int, i
             ) from error
         for entry in entries:
             entry_relative = (*relative, entry.name)
+            if not relative and entry.name.startswith(ignored_root_prefixes):
+                continue
             entry_in_environment = in_environment or (
                 split_environments
                 and len(entry_relative) == 3
@@ -484,18 +498,11 @@ def _require_directory(path: Path) -> None:
 
 def _lock_directory(path: Path, *, blocking: bool = True) -> int:
     _require_directory(path)
-    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
-    operation = fcntl.LOCK_EX if blocking else fcntl.LOCK_EX | fcntl.LOCK_NB
     try:
-        fcntl.flock(descriptor, operation)
+        return _raw_lock_directory(path, blocking=blocking)
     except BlockingIOError as error:
-        os.close(descriptor)
         raise LockUnavailableError(f"directory is locked: {path}") from error
-    return descriptor
 
 
 def _unlock_directory(descriptor: int) -> None:
-    try:
-        fcntl.flock(descriptor, fcntl.LOCK_UN)
-    finally:
-        os.close(descriptor)
+    _raw_unlock_directory(descriptor)
