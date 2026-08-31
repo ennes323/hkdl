@@ -50,6 +50,9 @@ from .run_contracts import (
     _model_id,
     _run_id,
 )
+from .research_json import dump_json, split_legacy_experiment, split_legacy_variant
+from .v2.maintenance import workspace_operation
+from .v2.leases import authoring_write
 from .storage import (
     AlreadyExistsError,
     NotFoundError,
@@ -68,6 +71,8 @@ class RunRecord:
     snapshot: dict[str, Any]
     request: dict[str, Any]
     state: dict[str, Any]
+    graph_identity: dict[str, Any] | None = None
+    event_hash: str | None = None
 
 
 @dataclass(frozen=True)
@@ -75,6 +80,7 @@ class ModelRecord:
     path: Path
     address: str
     document: dict[str, Any]
+    graph_hash: str | None = None
 
 
 class RunStore:
@@ -84,10 +90,28 @@ class RunStore:
         *,
         now: Callable[[], datetime] | None = None,
         nonce: Callable[[int], bytes] | None = None,
+        graph_reads: bool = True,
     ):
         self.repository = repository
         self._now = now or (lambda: datetime.now(timezone.utc))
         self._nonce = nonce or secrets.token_bytes
+        self.graph_reads = graph_reads
+
+    def graph_reader(self):
+        from .v2.reader import current_reader
+
+        return current_reader(self.repository)
+
+    def run_lease(self, record: RunRecord):
+        if _v2_is_active(self.repository):
+            from .v2.execution import GraphRecorder
+            from .v2.leases import attempt_lease
+
+            identity = GraphRecorder(self.repository).identity(record)
+            return attempt_lease(self.repository, identity.attempt_hash, record.path)
+        from .storage import try_directory_lock
+
+        return try_directory_lock(record.path)
 
     def freeze(
         self,
@@ -109,6 +133,8 @@ class RunStore:
         validate_snapshot(snapshot)
         return snapshot
 
+    @workspace_operation
+    @authoring_write
     def allocate(
         self,
         experiment: ExperimentRecord,
@@ -125,6 +151,12 @@ class RunStore:
             Callable[[list[RunRecord], list[ModelRecord]], None] | None
         ) = None,
     ) -> RunRecord:
+        if _v2_is_active(self.repository) and retry_of is None:
+            from .v2.graph import V2Graph
+
+            graph = V2Graph(self.repository)
+            graph.assert_experiment_clean(str(experiment.document["name"]), experiment)
+            graph.assert_variant_clean(str(experiment.document["name"]), variant)
         root = self.variant_root(
             experiment.document["name"],
             variant.document["name"],
@@ -144,7 +176,7 @@ class RunStore:
                         variant=variant.document["name"],
                     ),
                 )
-            run_id = f"run-{self._next_run_number(runs):03d}"
+            run_id = f"run-{self._next_run_number(experiment, variant, runs):03d}"
             timestamp = _utc_timestamp(self._now())
             if snapshot is None:
                 snapshot = self.freeze(experiment, variant, source_digest)
@@ -182,6 +214,18 @@ class RunStore:
                 (candidate / "metrics").mkdir()
                 (candidate / "artifacts/checkpoints").mkdir(parents=True)
                 atomic_write_new(candidate / "snapshot.yaml", dump_yaml(snapshot))
+                if _v2_is_active(self.repository):
+                    readable = candidate / "snapshot"
+                    readable.mkdir()
+                    split = split_legacy_variant(snapshot["variant"])
+                    atomic_write_new(
+                        readable / "experiment.json",
+                        dump_json(split_legacy_experiment(snapshot["experiment"])),
+                    )
+                    atomic_write_new(readable / "code.json", dump_json(split.code))
+                    atomic_write_new(
+                        readable / "options.json", dump_json(split.options)
+                    )
                 atomic_write_new(candidate / "request.json", _json_text(request))
                 atomic_write_new(candidate / "state.json", _json_text(state))
                 target_path = runs / run_id
@@ -189,17 +233,24 @@ class RunStore:
                     raise AlreadyExistsError(f"Run already exists: {run_id}")
                 os.rename(candidate, target_path)
                 _fsync_directory(runs)
-                return RunRecord(
+                record = RunRecord(
                     target_path,
                     f"{request['experiment']}/{request['variant']}/{run_id}",
                     snapshot,
                     request,
                     state,
                 )
+                _record_v2_allocation(self.repository, record)
+                return (
+                    self.load(request["experiment"], request["variant"], run_id)
+                    if _v2_is_active(self.repository)
+                    else record
+                )
             finally:
                 if candidate.exists():
                     shutil.rmtree(candidate)
 
+    @workspace_operation
     def update_state(self, record: RunRecord, **changes: Any) -> RunRecord:
         if record.state["status"] in TERMINAL_STATUSES:
             raise ContractError(f"terminal Run is sealed: {record.address}")
@@ -208,18 +259,61 @@ class RunStore:
         state["updated_at"] = _utc_timestamp(self._now())
         validate_state(state)
         atomic_replace(record.path / "state.json", _json_text(state))
-        return RunRecord(
+        updated = RunRecord(
             record.path,
             record.address,
             record.snapshot,
             record.request,
             state,
         )
+        _record_v2_state(self.repository, updated)
+        return (
+            self.load(
+                record.request["experiment"],
+                record.request["variant"],
+                record.request["run_id"],
+            )
+            if _v2_is_active(self.repository)
+            else updated
+        )
 
+    @workspace_operation
     def load(self, experiment: str, variant: str, run_id: str) -> RunRecord:
         _identity(experiment, "Experiment")
         _identity(variant, "Variant")
         _run_id(run_id)
+        if self.graph_reads and _v2_is_active(self.repository):
+            return self.graph_reader().run(experiment, variant, run_id)
+        projection_names = _v2_projection_names(
+            self.repository,
+            experiment,
+            variant,
+        )
+        if projection_names is not None:
+            for physical_experiment in _v2_experiment_projection_names(
+                self.repository, experiment
+            ):
+                for projection_name in projection_names:
+                    try:
+                        record = self._load_run_physical(
+                            physical_experiment,
+                            projection_name,
+                            run_id,
+                        )
+                    except NotFoundError:
+                        continue
+                    return _v2_readdress_run(
+                        self.repository, record, variant, experiment
+                    )
+            raise NotFoundError(f"Run not found: {experiment}/{variant}/{run_id}")
+        return self._load_run_physical(experiment, variant, run_id)
+
+    def _load_run_physical(
+        self,
+        experiment: str,
+        variant: str,
+        run_id: str,
+    ) -> RunRecord:
         root = self.variant_root(experiment, variant, create=False)
         path = root / "runs" / run_id
         if not os.path.lexists(path):
@@ -245,6 +339,7 @@ class RunStore:
             raise OwnershipError(f"Run ownership mismatch: {address}")
         return RunRecord(path, address, snapshot, request, state)
 
+    @workspace_operation
     def scan(
         self,
         *,
@@ -255,10 +350,14 @@ class RunStore:
             _identity(experiment, "Experiment")
         if variant is not None:
             _identity(variant, "Variant")
+        if self.graph_reads and _v2_is_active(self.repository):
+            return self.graph_reader().runs(experiment=experiment, variant=variant)
         outputs = self.repository.outputs
         if not os.path.lexists(outputs):
             return []
         _existing_directory(outputs)
+        if _v2_is_active(self.repository):
+            return self._scan_v2(experiment=experiment, variant=variant)
         records: list[RunRecord] = []
         for experiment_entry in _catalog_directories(outputs, ignore={"index.db"}):
             _identity(experiment_entry.name, "Run Experiment")
@@ -282,6 +381,64 @@ class RunStore:
                             run_entry.name,
                         )
                     )
+        return sorted(records, key=_run_sort_key)
+
+    def _scan_v2(
+        self,
+        *,
+        experiment: str | None,
+        variant: str | None,
+    ) -> list[RunRecord]:
+        if experiment is not None and variant is not None:
+            _v2_projection_names(self.repository, experiment, variant)
+        records: list[RunRecord] = []
+        addresses: set[str] = set()
+        for experiment_entry in _catalog_directories(
+            self.repository.outputs, ignore={"index.db"}
+        ):
+            _identity(experiment_entry.name, "Run Experiment")
+            current_experiment = _v2_current_experiment_name(
+                self.repository, experiment_entry.name
+            )
+            if current_experiment is None or (
+                experiment is not None and current_experiment != experiment
+            ):
+                continue
+            for variant_entry in _catalog_directories(experiment_entry):
+                _identity(variant_entry.name, "Run Variant")
+                current_name = _v2_current_variant_name(
+                    self.repository,
+                    current_experiment,
+                    variant_entry.name,
+                )
+                if current_name is None or (
+                    variant is not None and current_name != variant
+                ):
+                    continue
+                self._reject_legacy_layout(variant_entry)
+                runs = variant_entry / "runs"
+                if not os.path.lexists(runs):
+                    continue
+                _existing_directory(runs)
+                for run_entry in _catalog_directories(runs):
+                    _run_id(run_entry.name)
+                    physical = self._load_run_physical(
+                        experiment_entry.name,
+                        variant_entry.name,
+                        run_entry.name,
+                    )
+                    record = _v2_readdress_run(
+                        self.repository,
+                        physical,
+                        current_name,
+                        current_experiment,
+                    )
+                    if record.address in addresses:
+                        raise ContractError(
+                            f"duplicate v2 Run projection: {record.address}"
+                        )
+                    addresses.add(record.address)
+                    records.append(record)
         return sorted(records, key=_run_sort_key)
 
     def allocate_model(
@@ -346,15 +503,24 @@ class RunStore:
                     raise AlreadyExistsError(f"Model already exists: {model_id}")
                 os.rename(candidate, target_path)
                 _fsync_directory(models)
-                return ModelRecord(
+                model = ModelRecord(
                     target_path,
                     f"{document['experiment']}/{document['variant']}/{model_id}",
                     document,
+                )
+                _record_v2_model(self.repository, record, model)
+                return (
+                    self.load_model_manifest(
+                        document["experiment"], document["variant"], model_id
+                    )
+                    if _v2_is_active(self.repository)
+                    else model
                 )
             finally:
                 if candidate.exists():
                     shutil.rmtree(candidate)
 
+    @workspace_operation
     def load_model_manifest(
         self,
         experiment: str,
@@ -364,6 +530,38 @@ class RunStore:
         _identity(experiment, "Experiment")
         _identity(variant, "Variant")
         _model_id(model_id)
+        if self.graph_reads and _v2_is_active(self.repository):
+            return self.graph_reader().model(experiment, variant, model_id)
+        projection_names = _v2_projection_names(
+            self.repository,
+            experiment,
+            variant,
+        )
+        if projection_names is not None:
+            for physical_experiment in _v2_experiment_projection_names(
+                self.repository, experiment
+            ):
+                for projection_name in projection_names:
+                    try:
+                        model = self._load_model_manifest_physical(
+                            physical_experiment,
+                            projection_name,
+                            model_id,
+                        )
+                    except NotFoundError:
+                        continue
+                    return _v2_readdress_model(
+                        self.repository, model, variant, experiment
+                    )
+            raise NotFoundError(f"Model not found: {experiment}/{variant}/{model_id}")
+        return self._load_model_manifest_physical(experiment, variant, model_id)
+
+    def _load_model_manifest_physical(
+        self,
+        experiment: str,
+        variant: str,
+        model_id: str,
+    ) -> ModelRecord:
         root = self.variant_root(experiment, variant, create=False)
         path = root / "models" / model_id
         if not os.path.lexists(path):
@@ -388,6 +586,19 @@ class RunStore:
             raise ContractError("Model checkpoint digest changed")
         return model
 
+    def _load_model_physical(
+        self,
+        experiment: str,
+        variant: str,
+        model_id: str,
+    ) -> ModelRecord:
+        model = self._load_model_manifest_physical(experiment, variant, model_id)
+        checkpoint = self.resolve_model_checkpoint(model)
+        if _file_digest(checkpoint) != model.document["checkpoint"]["digest"]:
+            raise ContractError("Model checkpoint digest changed")
+        return model
+
+    @workspace_operation
     def scan_model_manifests(
         self,
         *,
@@ -400,6 +611,7 @@ class RunStore:
             load=self.load_model_manifest,
         )
 
+    @workspace_operation
     def scan_models(
         self,
         *,
@@ -419,18 +631,65 @@ class RunStore:
         variant: str,
         load: Callable[[str, str, str], ModelRecord],
     ) -> list[ModelRecord]:
-        try:
-            root = self.variant_root(experiment, variant, create=False)
-        except NotFoundError:
-            return []
-        models = root / "models"
-        if not os.path.lexists(models):
-            return []
-        _existing_directory(models)
+        if self.graph_reads and _v2_is_active(self.repository):
+            models = self.graph_reader().models(experiment, variant)
+            if load.__name__ == "load_model":
+                for model in models:
+                    self.resolve_model_checkpoint(model)
+            return models
         result: list[ModelRecord] = []
-        for entry in _catalog_directories(models):
-            _model_id(entry.name)
-            result.append(load(experiment, variant, entry.name))
+        projection_names = _v2_projection_names(
+            self.repository,
+            experiment,
+            variant,
+        )
+        names = projection_names if projection_names is not None else (variant,)
+        seen: set[str] = set()
+        physical_experiments = (
+            _v2_experiment_projection_names(self.repository, experiment)
+            if projection_names is not None
+            else (experiment,)
+        )
+        for physical_experiment in physical_experiments:
+            for projection_name in names:
+                try:
+                    root = self.variant_root(
+                        physical_experiment, projection_name, create=False
+                    )
+                except NotFoundError:
+                    continue
+                models = root / "models"
+                if not os.path.lexists(models):
+                    continue
+                _existing_directory(models)
+                for entry in _catalog_directories(models):
+                    _model_id(entry.name)
+                    if entry.name in seen:
+                        raise ContractError(
+                            f"duplicate v2 Model projection: "
+                            f"{experiment}/{variant}/{entry.name}"
+                        )
+                    seen.add(entry.name)
+                    physical = (
+                        self._load_model_manifest_physical(
+                            physical_experiment,
+                            projection_name,
+                            entry.name,
+                        )
+                        if load.__name__ == "load_model_manifest"
+                        else self._load_model_physical(
+                            physical_experiment,
+                            projection_name,
+                            entry.name,
+                        )
+                    )
+                    result.append(
+                        _v2_readdress_model(
+                            self.repository, physical, variant, experiment
+                        )
+                        if projection_names is not None
+                        else physical
+                    )
         return sorted(
             result,
             key=lambda item: (
@@ -440,17 +699,25 @@ class RunStore:
         )
 
     def resolve_model_checkpoint(self, model: ModelRecord) -> Path:
-        root = self.variant_root(
-            model.document["experiment"],
-            model.document["variant"],
-            create=False,
-        )
+        if model.graph_hash is not None:
+            reader = self.graph_reader()
+            payload = reader.object(model.graph_hash, "model")
+            blob = reader.object(payload["checkpoint_blob"], "blob")
+            if blob["content_hash"] != model.document["checkpoint"]["digest"]:
+                raise ContractError("v2 Model checkpoint identity mismatch")
+            return reader.graph.store.verify_blob(payload["checkpoint_blob"])
+        root = model.path.parents[1]
         relative = PurePosixPath(model.document["checkpoint"]["path"])
         path = root.joinpath(*relative.parts)
         _contained_regular_file(root, path, "Model checkpoint")
         return path
 
     def resolve_worker_log(self, record: RunRecord) -> Path:
+        if (
+            record.event_hash is not None
+            and record.state["status"] in TERMINAL_STATUSES
+        ):
+            return self.graph_reader().artifact(record, "worker.log")
         path = record.path / "worker.log"
         if not os.path.lexists(path):
             raise NotFoundError(f"Run log not found: {record.address}")
@@ -485,6 +752,10 @@ class RunStore:
     def load_evaluation(self, record: RunRecord) -> dict[str, Any]:
         if record.request["action"] != "eval":
             raise ContractError("Run is not an evaluation")
+        if record.event_hash is not None:
+            if record.state["status"] != "done":
+                raise ContractError("Eval Run has no completed result")
+            return self.graph_reader().evaluation(record)
         path = record.path / "metrics/eval.json"
         if not os.path.lexists(path):
             raise ContractError(f"completed Eval Run has no metrics: {record.address}")
@@ -504,6 +775,23 @@ class RunStore:
             return {}
         if required is None:
             required = record.state["status"] == "done"
+        if (
+            record.event_hash is not None
+            and record.state["status"] in TERMINAL_STATUSES
+        ):
+            try:
+                path = self.graph_reader().artifact(
+                    record, "metrics/train-summary.json"
+                )
+            except NotFoundError:
+                if required:
+                    raise ContractError(
+                        f"completed Train Run has no metric summary: {record.address}"
+                    ) from None
+                return {}
+            summary = _load_json(path)
+            _validate_training_metric_summary(summary)
+            return deepcopy(summary["metrics"])
         path = record.path / "metrics/train-summary.json"
         if not os.path.lexists(path):
             if required:
@@ -517,6 +805,13 @@ class RunStore:
         return deepcopy(summary["metrics"])
 
     def load_training_metrics(self, record: RunRecord) -> dict[str, Any]:
+        if (
+            record.event_hash is not None
+            and record.state["status"] in TERMINAL_STATUSES
+        ):
+            from .v2.execution import GraphRecorder
+
+            return GraphRecorder(self.repository).load_training_metrics(record)
         chunk = self.load_training_metric_chunk(record, offset=0)
         events = chunk["events"]
         partial = chunk["partial"]
@@ -553,6 +848,19 @@ class RunStore:
         if "local" not in validate_tracker(record.snapshot["variant"]["tracker"]):
             raise ContractError("Train Run does not use local tracking")
         history_path = record.path / "metrics/train.jsonl"
+        captured = (
+            record.event_hash is not None
+            and record.state["status"] in TERMINAL_STATUSES
+        )
+        if captured:
+            try:
+                history_path = self.graph_reader().artifact(
+                    record, "metrics/train.jsonl"
+                )
+            except NotFoundError:
+                if offset or record.state["status"] == "done":
+                    raise ContractError("Train metric history is unavailable") from None
+                return {"events": [], "offset": 0, "partial": False}
         if not os.path.lexists(history_path):
             if offset:
                 raise ContractError("Train metric history disappeared while following")
@@ -561,7 +869,8 @@ class RunStore:
                     f"completed Train Run has no metric history: {record.address}"
                 )
             return {"events": [], "offset": 0, "partial": False}
-        _contained_regular_file(record.path, history_path, "Train metric history")
+        if not captured:
+            _contained_regular_file(record.path, history_path, "Train metric history")
         events: list[dict[str, Any]] = []
         seen: set[tuple[str, int]] = set()
         partial = False
@@ -656,8 +965,19 @@ class RunStore:
     def json_text(document: Mapping[str, Any]) -> str:
         return _json_text(document)
 
-    @staticmethod
-    def _next_run_number(runs: Path) -> int:
+    def _next_run_number(
+        self,
+        experiment: ExperimentRecord,
+        variant: VariantRecord,
+        runs: Path,
+    ) -> int:
+        projected = _v2_next_run_number(
+            self.repository,
+            str(experiment.document["name"]),
+            str(variant.document["name"]),
+        )
+        if projected is not None:
+            return projected
         maximum = 0
         for entry in os.scandir(runs):
             if entry.name.startswith("."):
@@ -912,6 +1232,122 @@ def _utc_timestamp(value: datetime) -> str:
         .isoformat()
         .replace("+00:00", "Z")
     )
+
+
+def _record_v2_allocation(repository: RepositoryPaths, record: RunRecord) -> None:
+    from .v2.execution import GraphRecorder
+
+    recorder = GraphRecorder(repository)
+    if recorder.active():
+        recorder.record_allocation(record)
+
+
+def _record_v2_state(repository: RepositoryPaths, record: RunRecord) -> None:
+    from .v2.execution import GraphRecorder
+
+    recorder = GraphRecorder(repository)
+    if recorder.active():
+        recorder.record_state(record)
+
+
+def _record_v2_model(
+    repository: RepositoryPaths,
+    record: RunRecord,
+    model: ModelRecord,
+) -> None:
+    from .v2.execution import GraphRecorder
+
+    recorder = GraphRecorder(repository)
+    if recorder.active():
+        recorder.record_model(record, model)
+
+
+def _v2_is_active(repository: RepositoryPaths) -> bool:
+    from .v2.execution import GraphRecorder
+
+    return GraphRecorder(repository).active()
+
+
+def _v2_projection_names(
+    repository: RepositoryPaths,
+    experiment: str,
+    variant: str,
+) -> tuple[str, ...] | None:
+    from .v2.execution import GraphRecorder
+
+    recorder = GraphRecorder(repository)
+    if not recorder.active():
+        return None
+    return recorder.projection_variant_names(experiment, variant)
+
+
+def _v2_experiment_projection_names(
+    repository: RepositoryPaths,
+    experiment: str,
+) -> tuple[str, ...]:
+    from .v2.execution import GraphRecorder
+
+    return GraphRecorder(repository).projection_experiment_names(experiment)
+
+
+def _v2_current_experiment_name(
+    repository: RepositoryPaths,
+    projection_name: str,
+) -> str | None:
+    from .v2.execution import GraphRecorder
+
+    recorder = GraphRecorder(repository)
+    if not recorder.active():
+        return projection_name
+    return recorder.current_experiment_name_for_projection(projection_name)
+
+
+def _v2_current_variant_name(
+    repository: RepositoryPaths,
+    experiment: str,
+    projection_name: str,
+) -> str | None:
+    from .v2.execution import GraphRecorder
+
+    recorder = GraphRecorder(repository)
+    if not recorder.active():
+        return projection_name
+    return recorder.current_variant_name_for_projection(experiment, projection_name)
+
+
+def _v2_readdress_run(
+    repository: RepositoryPaths,
+    record: RunRecord,
+    variant: str,
+    experiment: str | None = None,
+) -> RunRecord:
+    from .v2.execution import GraphRecorder
+
+    return GraphRecorder(repository).readdress_run(record, variant, experiment)
+
+
+def _v2_readdress_model(
+    repository: RepositoryPaths,
+    model: ModelRecord,
+    variant: str,
+    experiment: str | None = None,
+) -> ModelRecord:
+    from .v2.execution import GraphRecorder
+
+    return GraphRecorder(repository).readdress_model(model, variant, experiment)
+
+
+def _v2_next_run_number(
+    repository: RepositoryPaths,
+    experiment: str,
+    variant: str,
+) -> int | None:
+    from .v2.execution import GraphRecorder
+
+    recorder = GraphRecorder(repository)
+    if not recorder.active():
+        return None
+    return recorder.next_run_number(experiment, variant)
 
 
 __all__ = [

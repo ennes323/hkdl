@@ -1,0 +1,122 @@
+{
+  "classes": [
+    "circle",
+    "rectangle"
+  ],
+  "entries": [
+    {
+      "class_id": 0,
+      "image": "images/train/train-00.png",
+      "image_sha256": "e1c91cb8f7c92228c466738913f389895f60c85bb694af9fd42836953530621a",
+      "label": "labels/train/train-00.txt",
+      "label_sha256": "174e2d814ad6d391dab8466602095ac9aa2adb870f8d82896ed0b22fae713099",
+      "split": "train",
+      "stem": "train-00"
+    },
+    {
+      "class_id": 1,
+      "image": "images/train/train-01.png",
+      "image_sha256": "dc6c3651bb0b94a432422e69b498061f7fbbb8cf5b123bc59660d17911593bd2",
+      "label": "labels/train/train-01.txt",
+      "label_sha256": "ea5e151cab4b4a757bf02bdd30c497281f6a80d077ebe13f9486f3c18524ce81",
+      "split": "train",
+      "stem": "train-01"
+    },
+    {
+      "class_id": 0,
+      "image": "images/train/train-02.png",
+      "image_sha256": "194fa40eb15702fe7537f790ce060e621b0ed3d071c9b0d020e412ab00311e09",
+      "label": "labels/train/train-02.txt",
+      "label_sha256": "f555f07f7e7e0d493e69005938bb0262d63bd1f799c6f48e3fbae5c4d9644e77",
+      "split": "train",
+      "stem": "train-02"
+    },
+    {
+      "class_id": 1,
+      "image": "images/train/train-03.png",
+      "image_sha256": "fd9789de63a95ba582b181602cd4422c4a1f0c68f6585e43c6895674f26ba243",
+      "label": "labels/train/train-03.txt",
+      "label_sha256": "b6f955226235610787294b254fd1e9b3867e375cae3bc974ed2b2bad283defd9",
+      "split": "train",
+      "stem": "train-03"
+    },
+    {
+      "class_id": 0,
+      "image": "images/train/train-04.png",
+      "image_sha256": "caaefbc2b9a78829f4ac48cf18cb6a7084741736990688bf74d84d92fe72ad9d",
+      "label": "labels/train/train-04.txt",
+      "label_sha256": "6f7da0ba73b51b93e1985562274f8fb9207611943f940daba492149e4dce5792",
+      "split": "train",
+      "stem": "train-04"
+    },
+    {
+      "class_id": 1,
+      "image": "images/train/train-05.png",
+      "image_sha256": "58522bf0a70e4496a92ba4aef38f3905e6d8b1dfcba084efe02b6dd749d899c6",
+      "label": "labels/train/train-05.txt",
+      "label_sha256": "16f5398e45914029b1f0f4a2f3e5ed74318275f3c5151a2d8adf531998cc41a6",
+      "split": "train",
+      "stem": "train-05"
+    },
+    {
+      "class_id": 0,
+      "image": "images/train/train-06.png",
+      "image_sha256": "11686a088d5040468603fa3e2b51e42534924c59b71b496cb208837b01d787f2",
+      "label": "labels/train/train-06.txt",
+      "label_sha256": "3655ca1227fa5c73020f194b373e1aaca0cc3531f46bd09f81ad5357de8cd7f7",
+      "split": "train",
+      "stem": "train-06"
+    },
+    {
+      "class_id": 1,
+      "image": "images/train/train-07.png",
+      "image_sha256": "f121c54e95c07877e7ee5725fa9b81fa7a9d9a331ee35276331bf1c30fb40a7a",
+      "label": "labels/train/train-07.txt",
+      "label_sha256": "f033658d97d2180b85a6ae2e627ab4fd73e6497ba5d90cb2fb37649e74d99b31",
+      "split": "train",
+      "stem": "train-07"
+    },
+    {
+      "class_id": 0,
+      "image": "images/val/val-00.png",
+      "image_sha256": "816448abda7418e9a6d32ad6122929d888802d6c293a49915c03334e56276860",
+      "label": "labels/val/val-00.txt",
+      "label_sha256": "f29bf55bb6d8f485bd690968c0e523a3a94d1fe43b85923e0f2951ed9c31031f",
+      "split": "val",
+      "stem": "val-00"
+    },
+    {
+      "class_id": 1,
+      "image": "images/val/val-01.png",
+      "image_sha256": "58345b7e80038b85f4a1811ee8ab154bab7c3c518111e36b712f7d5dbc554f61",
+      "label": "labels/val/val-01.txt",
+      "label_sha256": "4ac610af6ae57c0c1e7b41f4fbccd89119d52517769196f9bce608253adccdf5",
+      "split": "val",
+      "stem": "val-01"
+    },
+    {
+      "class_id": 0,
+      "image": "images/val/val-02.png",
+      "image_sha256": "b8c0be2710156f462b8a5a93cea9a6b89970126c8d1f5df7ca3172f307dc4be4",
+      "label": "labels/val/val-02.txt",
+      "label_sha256": "9f58e047efed7f2340abed9f5128942fd3a264cb47e2cb9c838c398e799b0bb8",
+      "split": "val",
+      "stem": "val-02"
+    },
+    {
+      "class_id": 1,
+      "image": "images/val/val-03.png",
+      "image_sha256": "8eed386a48bd771181f6b29d40f3624601eb13a6a5dd17ef4c467fc82459c124",
+      "label": "labels/val/val-03.txt",
+      "label_sha256": "7824a8ef79e4be428ca50a93f854c9718c979521540e6ed190da67bcc08e8d7f",
+      "split": "val",
+      "stem": "val-03"
+    }
+  ],
+  "generator": "HKDL synthetic shapes v1",
+  "image_size": [
+    128,
+    128
+  ],
+  "schema_version": 1
+}

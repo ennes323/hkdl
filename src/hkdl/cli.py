@@ -12,7 +12,7 @@ from collections.abc import Callable, Iterable, Sequence
 from pathlib import Path
 from typing import Any
 
-from .authoring import Authoring
+from .authoring import Authoring, ExperimentRecord, VariantRecord
 from .config import ContractError
 from .completion import (
     SHELLS,
@@ -44,6 +44,7 @@ from .migration import Migration
 from .recovery import Recovery, RecoveryFailure, RecoveryInterrupted
 from .run_contracts import MAX_SEED, TERMINAL_STATUSES
 from .runs import RunRecord, RunStore
+from .settings import WorkspaceSettingsStore
 from .status import Status, render_status_tree
 from .status_index import IndexFailure, IndexReport
 from .storage import (
@@ -55,6 +56,19 @@ from .storage import (
 )
 from .training import Training, TrainingFailure, TrainingInterrupted
 from .update import UpdateConflict, UpdateFailure, update
+from .web import DEFAULT_WEB_PORT, WebFailure, serve as serve_web
+from .v2.authoring import V2Authoring
+from .v2.authoring_migration import (
+    AuthoringMigration,
+    AuthoringMigrationConflict,
+)
+from .v2.deletion import DeletionConflict, RunDeletionService
+from .v2.graph import DirtyDraftError
+from .v2.graph import V2Graph
+from .v2.execution import GraphRecorder
+from .v2.migration import MigrationConflict, WorkspaceMigration
+from .v2.maintenance import WorkspaceBusy, workspace_access
+from .config import DIGEST_PATTERN
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -65,8 +79,46 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("--follow requires --output text")
     if getattr(args, "table", False) and args.output == "json":
         parser.error("--table requires --output text")
+    if getattr(args, "noun", None) == "migrate":
+        migrate_all = getattr(args, "all", False)
+        migrate_authoring = getattr(args, "authoring", False)
+        migrate_dry_run = getattr(args, "dry_run", False)
+        migrate_yes = getattr(args, "yes", False)
+        migrate_output = getattr(args, "output", "text")
+        if sum(map(bool, (migrate_all, migrate_authoring, args.path))) != 1:
+            parser.error("migrate requires exactly one of PATH, --all, or --authoring")
+        if args.path is not None and (migrate_dry_run or migrate_yes):
+            parser.error("--dry-run and --yes require --all or --authoring")
+        if args.path is not None and migrate_output != "text":
+            parser.error("--output requires --all or --authoring")
+        if migrate_authoring and bool(migrate_dry_run) == bool(migrate_yes):
+            parser.error("--authoring requires exactly one of --dry-run or --yes")
+        if getattr(args, "tracker_default", None) is not None and not migrate_authoring:
+            parser.error("--tracker-default requires --authoring")
+        expected_plan = getattr(args, "expect_plan", None)
+        if expected_plan is not None and (
+            not migrate_authoring
+            or not migrate_yes
+            or not DIGEST_PATTERN.fullmatch(expected_plan)
+        ):
+            parser.error(
+                "--expect-plan requires --authoring --yes and a full sha256 digest"
+            )
+    if (getattr(args, "noun", None), getattr(args, "verb", None)) == (
+        "run",
+        "delete",
+    ) and bool(args.dry_run) == bool(args.yes):
+        parser.error("run delete requires exactly one of --dry-run or --yes")
     try:
-        return _dispatch(args)
+        if args.noun in {"migrate", "web", "completion"} or (
+            args.noun == "experiment" and args.verb == "create"
+        ):
+            return _dispatch(args)
+        with workspace_access(validate_repository_root()):
+            return _dispatch(args)
+    except WorkspaceBusy as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 5
     except EvaluationInterrupted as error:
         print(f"interrupted {error.address}", file=sys.stderr)
         return 130
@@ -106,6 +158,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     except LifecycleConflict as error:
         print(f"error: {error}", file=sys.stderr)
         return 5
+    except DirtyDraftError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 5
+    except DeletionConflict as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 5
+    except MigrationConflict as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 5
+    except AuthoringMigrationConflict as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 5
     except UpdateConflict as error:
         print(f"error: {error}", file=sys.stderr)
         return 5
@@ -127,6 +191,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     except IndexFailure as error:
         print(f"error: index operation failed: {error}", file=sys.stderr)
         return 6
+    except WebFailure as error:
+        print(f"error: web server failed: {error}", file=sys.stderr)
+        return 6
 
 
 def _dispatch(args: argparse.Namespace) -> int:
@@ -136,8 +203,113 @@ def _dispatch(args: argparse.Namespace) -> int:
 
     repository = validate_repository_root()
     if args.noun == "migrate":
-        result = Migration(repository).migrate(args.path)
-        print(f"already current {result.path} schema={result.schema_version}")
+        if args.path is not None:
+            result = Migration(repository).migrate(args.path)
+            print(f"already current {result.path} schema={result.schema_version}")
+            return 0
+        if getattr(args, "authoring", False):
+            migration = AuthoringMigration(
+                repository, tracker_default=getattr(args, "tracker_default", None)
+            )
+            expected_plan = getattr(args, "expect_plan", None)
+            recovered = (
+                migration.recover(expected_plan=expected_plan)
+                if getattr(args, "yes", False)
+                else None
+            )
+            plan = migration.plan()
+            if (
+                recovered
+                and recovered["outcome"] == "completed"
+                and not plan.report.already_current
+            ):
+                raise AuthoringMigrationConflict(
+                    "approved cutover recovered; additional changes require a new dry-run"
+                )
+            if (
+                expected_plan is not None
+                and not (recovered and recovered["outcome"] == "completed")
+                and expected_plan != plan.plan_digest
+            ):
+                raise AuthoringMigrationConflict(
+                    "migration plan differs from the approved digest; run dry-run again"
+                )
+            report = plan.report.as_dict()
+            dry_run = getattr(args, "dry_run", False)
+            output = getattr(args, "output", "text")
+            if dry_run:
+                if output == "json":
+                    _json(
+                        {
+                            "authoring_migration": report,
+                            "dry_run": True,
+                            "applied": False,
+                        }
+                    )
+                else:
+                    _authoring_migration_report(report, dry_run=True)
+                return 0 if plan.report.cutover_ready else 5
+            migration.apply(plan)
+            if output == "json":
+                _json(
+                    {
+                        "authoring_migration": report,
+                        "dry_run": False,
+                        "applied": True,
+                        "recovery": recovered,
+                    }
+                )
+            else:
+                _authoring_migration_report(report, dry_run=False)
+                print(f"activated authoring schema 2 plan={plan.report.plan_digest}")
+            return 0
+        migration = WorkspaceMigration(repository)
+        plan = migration.plan()
+        output = getattr(args, "output", "text")
+        dry_run = getattr(args, "dry_run", False)
+        if dry_run:
+            if output == "json":
+                _json(
+                    {
+                        "migration": plan.report.as_dict(),
+                        "dry_run": True,
+                        "applied": False,
+                    }
+                )
+            else:
+                _migration_report(plan.report.as_dict(), dry_run=True)
+            return 0
+        if output != "json":
+            _migration_report(plan.report.as_dict(), dry_run=False)
+        if plan.report.active_leases:
+            raise MigrationConflict("active Run lease blocks migration")
+        if plan.report.malformed_records:
+            raise ContractError("malformed v1 records block migration")
+        if not getattr(args, "yes", False) and not _confirm(
+            "Cut over this workspace to HKDL v2?"
+        ):
+            if output == "json":
+                _json(
+                    {
+                        "migration": plan.report.as_dict(),
+                        "dry_run": False,
+                        "applied": False,
+                    }
+                )
+            else:
+                print("Migration cancelled. v1 remains authoritative.")
+            return 0
+        migration.apply(plan)
+        if output == "json":
+            _json(
+                {
+                    "migration": plan.report.as_dict(),
+                    "dry_run": False,
+                    "applied": True,
+                }
+            )
+        else:
+            print(f"activated v2 plan={plan.report.plan_digest}")
         return 0
     if args.noun == "update":
         update(repository, assume_yes=args.yes)
@@ -162,8 +334,87 @@ def _dispatch(args: argparse.Namespace) -> int:
         else:
             _index_report(status.rebuild_index())
         return 0
+    if args.noun == "web":
+        serve_web(repository, args.experiment, port=args.port)
+        return 0
+    if args.noun == "settings":
+        settings = WorkspaceSettingsStore(repository.root)
+        if args.verb == "show":
+            document = settings.show()
+            if args.output == "json":
+                _json({"settings": document})
+            else:
+                backend = document["tracker"]["backend"]
+                value = ",".join(backend) if isinstance(backend, list) else backend
+                print(f"tracker: {value}")
+            return 0
+        result = settings.set_tracker(args.backend)
+        if args.output == "json":
+            _json({"settings": result.as_dict()})
+        else:
+            backend = result.backend
+            value = ",".join(backend) if isinstance(backend, list) else backend
+            print(f"tracker: {value}")
+        return 0
 
     authoring = Authoring(repository)
+
+    if (args.noun, args.verb) == ("identity", "show"):
+        graph = V2Graph(repository)
+        if not graph.is_active():
+            raise ContractError("HKDL v2 is not active")
+        addresses = list(args.address)
+        expected = {"experiment": 1, "variant": 2, "run": 3, "model": 3}
+        if len(addresses) != expected[args.kind]:
+            raise ContractError(
+                f"identity show {args.kind} requires {expected[args.kind]} address values"
+            )
+        if args.kind == "experiment":
+            experiment_hash = graph.experiment_hash(addresses[0])
+            payload = {
+                "experiment": addresses[0],
+                "experiment_hash": experiment_hash,
+                "experiment_revision_hash": graph.current_revision(experiment_hash),
+            }
+        elif args.kind == "variant":
+            experiment_hash = graph.experiment_hash(addresses[0])
+            variant_hash = graph.variant_hash(experiment_hash, addresses[1])
+            revision_hash = graph.current_revision(variant_hash)
+            revision = graph.store.load(revision_hash)
+            payload = {
+                "experiment": addresses[0],
+                "variant": addresses[1],
+                "experiment_hash": experiment_hash,
+                "experiment_revision_hash": graph.current_revision(experiment_hash),
+                "variant_hash": variant_hash,
+                "variant_revision_hash": revision_hash,
+                "source_tree_hash": revision.payload["source_tree"],
+            }
+        elif args.kind == "run":
+            record = RunStore(repository).load(*addresses)
+            identity = GraphRecorder(repository).identity(record)
+            payload = {
+                "experiment": addresses[0],
+                "variant": addresses[1],
+                "run_id": addresses[2],
+                **identity.as_dict(),
+            }
+        else:
+            model_hash = GraphRecorder(repository).model_hash(*addresses)
+            model = graph.store.load(model_hash)
+            payload = {
+                "experiment": addresses[0],
+                "variant": addresses[1],
+                "model_id": addresses[2],
+                "model_hash": model_hash,
+                **model.payload,
+            }
+        if args.output == "json":
+            _json({"identity": payload})
+        else:
+            for key, value in payload.items():
+                print(f"{key}: {value}")
+        return 0
 
     if (args.noun, args.verb) == ("environment", "prune"):
         variants = [
@@ -254,20 +505,45 @@ def _dispatch(args: argparse.Namespace) -> int:
         print(f"created experiment {record.document['name']}")
         return 0
 
+    if (args.noun, args.verb) == ("experiment", "commit"):
+        identity = V2Authoring(authoring).commit_experiment(args.experiment)
+        payload = {
+            "experiment": args.experiment,
+            "changed": identity.changed,
+        }
+        if args.output == "json":
+            _json(payload)
+        else:
+            state = "committed" if identity.changed else "unchanged"
+            print(f"{state} experiment {args.experiment}")
+        return 0
+
+    if (args.noun, args.verb) == ("experiment", "rename"):
+        plan = V2Authoring(authoring).rename_experiment(
+            args.old_name,
+            args.new_name,
+            dry_run=args.dry_run,
+        )
+        payload = {
+            "old_name": plan.old_name,
+            "new_name": plan.new_name,
+            "changed": plan.changed,
+            "dry_run": args.dry_run,
+        }
+        if args.output == "json":
+            _json(payload)
+        else:
+            prefix = "would rename" if args.dry_run else "renamed"
+            print(f"{prefix} experiment {args.old_name} -> {args.new_name}")
+        return 0
+
     if (args.noun, args.verb) == ("experiment", "list"):
         experiments = authoring.list_experiments()
         if args.output == "json":
             _json(
                 {
                     "experiments": [
-                        {
-                            "name": item.document["name"],
-                            "type": item.document["type"],
-                            "template": {
-                                "name": item.document["template"]["name"],
-                            },
-                        }
-                        for item in experiments
+                        _experiment_payload(item, None) for item in experiments
                     ]
                 }
             )
@@ -310,7 +586,9 @@ def _dispatch(args: argparse.Namespace) -> int:
             _json(
                 {
                     "experiment": args.experiment,
-                    "variants": [{"name": item.document["name"]} for item in variants],
+                    "variants": [
+                        _variant_payload(item, None, None) for item in variants
+                    ],
                 }
             )
         else:
@@ -323,15 +601,57 @@ def _dispatch(args: argparse.Namespace) -> int:
     if (args.noun, args.verb) == ("variant", "check"):
         record = authoring.check_variant(args.experiment, args.variant)
         if args.output == "json":
+            payload = {
+                "experiment": record.experiment,
+                "variant": record.document["name"],
+                "valid": True,
+            }
+            _json(payload)
+        else:
+            print(f"valid {record.experiment}/{record.document['name']}")
+        return 0
+
+    if (args.noun, args.verb) == ("variant", "commit"):
+        identity = V2Authoring(authoring).commit_variant(
+            args.experiment,
+            args.variant,
+        )
+        payload = {
+            "experiment": args.experiment,
+            "variant": args.variant,
+            "changed": identity.changed,
+        }
+        if args.output == "json":
+            _json(payload)
+        else:
+            state = "committed" if identity.changed else "unchanged"
+            print(f"{state} variant {args.experiment}/{args.variant}")
+        return 0
+
+    if (args.noun, args.verb) == ("variant", "rename"):
+        plan = V2Authoring(authoring).rename_variant(
+            args.experiment,
+            args.old_name,
+            args.new_name,
+            dry_run=args.dry_run,
+        )
+        if args.output == "json":
             _json(
                 {
-                    "experiment": record.experiment,
-                    "variant": record.document["name"],
-                    "valid": True,
+                    "rename": {
+                        "experiment": plan.experiment,
+                        "old_name": plan.old_name,
+                        "new_name": plan.new_name,
+                        "changed": plan.changed,
+                    },
+                    "dry_run": args.dry_run,
                 }
             )
         else:
-            print(f"valid {record.experiment}/{record.document['name']}")
+            prefix = "would rename" if args.dry_run else "renamed"
+            print(
+                f"{prefix} variant {args.experiment}/{args.old_name} to {args.new_name}"
+            )
         return 0
 
     if (args.noun, args.verb) == ("run", "train"):
@@ -345,6 +665,7 @@ def _dispatch(args: argparse.Namespace) -> int:
                     args.training_group,
                     seed=seed,
                     device=args.device,
+                    tracker=args.tracker,
                 )
             except TrainingFailure as error:
                 address = f" for {error.address}" if error.address else ""
@@ -400,6 +721,7 @@ def _dispatch(args: argparse.Namespace) -> int:
             args.experiment,
             args.variant,
             args.run_id,
+            tracker=args.tracker,
         )
         action = record.request["action"]
         if action == "train":
@@ -422,13 +744,47 @@ def _dispatch(args: argparse.Namespace) -> int:
             )
         return 0
 
+    if (args.noun, args.verb) == ("run", "delete"):
+        service = RunDeletionService(authoring.repository)
+        result = service.delete(
+            args.experiment,
+            args.variant,
+            args.run_id,
+            cascade=args.cascade,
+            force_stale=args.force_stale,
+            yes=args.yes,
+            dry_run=args.dry_run,
+        )
+        document = _public_payload(result.as_dict())
+        if args.output == "json":
+            _json({"deletion": document, "dry_run": args.dry_run})
+        elif args.dry_run:
+            readiness = "ready" if document["ready"] else "blocked"
+            print(
+                f"deletion {readiness} {args.experiment}/{args.variant}/{args.run_id} "
+                f"runs={len(document['runs'])} models={len(document['models'])}"
+            )
+            for conflict in document["conflicts"]:
+                print(f"conflict: {conflict}")
+        else:
+            print(
+                f"deleted run {args.experiment}/{args.variant}/{args.run_id} "
+                f"transaction={document['transaction']}"
+            )
+        return 5 if args.dry_run and not document["ready"] else 0
+
     if (args.noun, args.verb) == ("run", "metrics"):
         store = RunStore(authoring.repository)
         record = store.load(args.experiment, args.variant, args.run_id)
         if args.follow:
             _follow_training_metrics(store, record)
             return 0
-        metrics = store.load_training_metrics(record)
+        recorder = GraphRecorder(authoring.repository)
+        metrics = (
+            recorder.load_training_metrics(record)
+            if recorder.active() and record.state["status"] in TERMINAL_STATUSES
+            else store.load_training_metrics(record)
+        )
         if args.output == "json":
             _json(
                 {
@@ -453,7 +809,13 @@ def _dispatch(args: argparse.Namespace) -> int:
     if (args.noun, args.verb) == ("run", "logs"):
         store = RunStore(authoring.repository)
         record = store.load(args.experiment, args.variant, args.run_id)
-        with store.resolve_worker_log(record).open("rb") as source:
+        recorder = GraphRecorder(authoring.repository)
+        log_path = (
+            recorder.artifact_path(record, "worker.log")
+            if recorder.active() and record.state["status"] in TERMINAL_STATUSES
+            else store.resolve_worker_log(record)
+        )
+        with log_path.open("rb") as source:
             while chunk := source.read(64 * 1024):
                 sys.stdout.buffer.write(chunk)
         sys.stdout.buffer.flush()
@@ -505,7 +867,7 @@ def _dispatch(args: argparse.Namespace) -> int:
             args.model_id,
         )
         if args.output == "json":
-            _json({"model": model.document})
+            _json({"model": dict(model.document)})
         else:
             for key in (
                 "model_id",
@@ -663,6 +1025,28 @@ def _parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     _output_argument(experiment_list)
+    experiment_commit = experiment_verbs.add_parser(
+        "commit",
+        help="Commit an Experiment draft revision",
+        description="Publish the current Experiment draft as an immutable v2 revision.",
+        epilog=_examples("hkdl experiment commit smoke"),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    _experiment_argument(experiment_commit)
+    _output_argument(experiment_commit)
+    experiment_rename = experiment_verbs.add_parser(
+        "rename",
+        help="Rename one Experiment binding and authored directory",
+    )
+    old_experiment = experiment_rename.add_argument(
+        "old_name", metavar="OLD", help="Existing Experiment name"
+    )
+    old_experiment.completer = complete_experiments
+    experiment_rename.add_argument("new_name", metavar="NEW", help="New name")
+    experiment_rename.add_argument(
+        "--dry-run", action="store_true", help="Preview without changing authority"
+    )
+    _output_argument(experiment_rename)
 
     variant = nouns.add_parser(
         "variant",
@@ -736,6 +1120,36 @@ def _parser() -> argparse.ArgumentParser:
     _experiment_argument(variant_check)
     _variant_argument(variant_check, help_text="Variant name")
     _output_argument(variant_check)
+    variant_commit = variant_verbs.add_parser(
+        "commit",
+        help="Commit a Variant draft revision",
+        description="Publish the current Variant recipe and source as a v2 revision.",
+        epilog=_examples("hkdl variant commit smoke baseline"),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    _experiment_argument(variant_commit)
+    _variant_argument(variant_commit, help_text="Variant draft to commit")
+    _output_argument(variant_commit)
+    variant_rename = variant_verbs.add_parser(
+        "rename",
+        help="Rename one Variant binding",
+        description="Atomically move one active Variant name binding without an alias.",
+        epilog=_examples(
+            "hkdl variant rename smoke old-name new-name --dry-run",
+            "hkdl variant rename smoke old-name new-name",
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    _experiment_argument(variant_rename)
+    old_name = variant_rename.add_argument("old_name", metavar="OLD")
+    old_name.completer = complete_variants
+    variant_rename.add_argument("new_name", metavar="NEW")
+    variant_rename.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show the binding change without writing it",
+    )
+    _output_argument(variant_rename)
 
     model = nouns.add_parser(
         "model",
@@ -797,6 +1211,7 @@ def _parser() -> argparse.ArgumentParser:
     training_group.completer = complete_training_groups
     _train_seed_argument(run_train)
     _device_argument(run_train)
+    _tracker_argument(run_train)
 
     run_eval = run_verbs.add_parser(
         "eval",
@@ -841,6 +1256,33 @@ def _parser() -> argparse.ArgumentParser:
     _experiment_argument(run_retry)
     _variant_argument(run_retry, help_text="Variant owning the Run")
     _run_argument(run_retry)
+    _tracker_argument(run_retry)
+
+    run_delete = run_verbs.add_parser(
+        "delete",
+        help="Delete an active Run lineage from the v2 graph",
+        description="Plan or apply a recoverable graph-aware Run deletion.",
+    )
+    _experiment_argument(run_delete)
+    _variant_argument(run_delete, help_text="Variant owning the Run")
+    _run_argument(run_delete)
+    run_delete.add_argument(
+        "--cascade",
+        action="store_true",
+        help="Include retry children, Models, Eval/Export Runs, and results",
+    )
+    run_delete.add_argument(
+        "--force-stale",
+        action="store_true",
+        help="Permit deletion of unlocked nonterminal Runs",
+    )
+    run_delete.add_argument(
+        "--dry-run", action="store_true", help="Show the exact deletion closure"
+    )
+    run_delete.add_argument(
+        "--yes", action="store_true", help="Confirm and apply the deletion"
+    )
+    _output_argument(run_delete)
 
     run_metrics = run_verbs.add_parser(
         "metrics",
@@ -912,6 +1354,23 @@ def _parser() -> argparse.ArgumentParser:
         help="Show aggregate evaluation results as a table",
     )
 
+    web = nouns.add_parser(
+        "web",
+        help="Open a local read-only Experiment view",
+        description="Serve one Experiment through a loopback-only read-only web view.",
+        epilog=_examples("hkdl web smoke", "hkdl web smoke --port 8765"),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    web.set_defaults(verb=None)
+    _experiment_argument(web, help_text="Experiment to inspect")
+    web.add_argument(
+        "--port",
+        type=_web_port,
+        default=DEFAULT_WEB_PORT,
+        metavar="PORT",
+        help=f"Loopback TCP port (default: {DEFAULT_WEB_PORT})",
+    )
+
     storage = nouns.add_parser(
         "storage",
         help="Inspect repository-owned storage usage",
@@ -921,6 +1380,50 @@ def _parser() -> argparse.ArgumentParser:
     )
     storage.set_defaults(verb=None)
     _output_argument(storage)
+
+    settings = nouns.add_parser(
+        "settings",
+        help="Inspect and change workspace execution settings",
+        description="Manage operational defaults outside research authoring files.",
+    )
+    settings_verbs = settings.add_subparsers(
+        title="commands", dest="verb", required=True
+    )
+    settings_show = settings_verbs.add_parser("show", help="Show workspace settings")
+    _output_argument(settings_show)
+    tracker = settings_verbs.add_parser("tracker", help="Manage tracker defaults")
+    tracker_verbs = tracker.add_subparsers(
+        title="commands", dest="settings_tracker_verb", required=True
+    )
+    tracker_set = tracker_verbs.add_parser(
+        "set", help="Set the workspace default tracker"
+    )
+    tracker_set.add_argument(
+        "backend",
+        metavar="BACKEND",
+        help="none, local, mlflow, or local+mlflow",
+    )
+    _output_argument(tracker_set)
+
+    identity = nouns.add_parser(
+        "identity",
+        help="Inspect content-addressed identity details",
+        description="Show full v2 hashes only when explicitly requested.",
+    )
+    identity_verbs = identity.add_subparsers(
+        title="commands", dest="verb", required=True
+    )
+    identity_show = identity_verbs.add_parser("show", help="Show one identity")
+    identity_show.add_argument(
+        "kind", choices=("experiment", "variant", "run", "model")
+    )
+    identity_show.add_argument(
+        "address",
+        nargs="+",
+        metavar="ADDRESS",
+        help="Experiment [Variant [Run or Model]]",
+    )
+    _output_argument(identity_show)
 
     index = nouns.add_parser(
         "index",
@@ -1008,21 +1511,71 @@ def _parser() -> argparse.ArgumentParser:
 
     migrate = nouns.add_parser(
         "migrate",
-        help="Inspect or migrate one authored schema",
-        description="Inspect or migrate one authored Experiment or Variant file.",
+        help="Inspect one schema or migrate the full workspace",
+        description=(
+            "Inspect or migrate one authored Experiment or Variant file. "
+            "Use --all for the complete v1 workspace."
+        ),
         epilog=_examples(
             "hkdl migrate experiments/smoke/experiment.yaml",
             "hkdl migrate experiments/smoke/baseline/variant.yaml",
+            "hkdl migrate --all --dry-run -o json",
+            "hkdl migrate --all --yes",
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     migrate.set_defaults(verb=None)
+    migrate.add_argument(
+        "--expect-plan",
+        default=argparse.SUPPRESS,
+        metavar="SHA256",
+        help="Require the approved authoring migration plan digest",
+    )
+    migrate.add_argument(
+        "--tracker-default",
+        choices=("none", "local", "mlflow", "local,mlflow"),
+        default=argparse.SUPPRESS,
+        help="Explicit future workspace tracker for --authoring; preserve Run history",
+    )
     migrate_path = migrate.add_argument(
         "path",
+        nargs="?",
         metavar="PATH",
         help="Repository-owned experiment.yaml or variant.yaml",
     )
     migrate_path.completer = file_completer
+    migrate.add_argument(
+        "--all",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="Plan or execute a complete v1-to-v2 workspace import",
+    )
+    migrate.add_argument(
+        "--authoring",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="Migrate active-v2 authored YAML and execution identity to schema 2",
+    )
+    migrate.add_argument(
+        "--dry-run",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="Compute and report the full import without writing authority",
+    )
+    migrate.add_argument(
+        "-y",
+        "--yes",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="Confirm v2 cutover without prompting",
+    )
+    migrate.add_argument(
+        "-o",
+        "--output",
+        choices=("text", "json"),
+        default=argparse.SUPPRESS,
+        help="Output format for --all (default: text)",
+    )
 
     update_parser = nouns.add_parser(
         "update",
@@ -1044,6 +1597,16 @@ def _parser() -> argparse.ArgumentParser:
 
 def _examples(*commands: str) -> str:
     return "examples:\n" + "\n".join(f"  {command}" for command in commands)
+
+
+def _web_port(value: str) -> int:
+    try:
+        port = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("port must be an integer") from error
+    if not 1 <= port <= 65535:
+        raise argparse.ArgumentTypeError("port must be between 1 and 65535")
+    return port
 
 
 def _index_report(report: IndexReport) -> None:
@@ -1174,6 +1737,14 @@ def _device_argument(parser: argparse.ArgumentParser) -> None:
     action.completer = complete_devices
 
 
+def _tracker_argument(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--tracker",
+        metavar="BACKEND",
+        help="Override workspace tracker: none, local, mlflow, or local+mlflow",
+    )
+
+
 def _output_argument(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "-o",
@@ -1287,8 +1858,125 @@ def _status_table(document: dict[str, Any]) -> None:
     )
 
 
+def _migration_report(report: dict[str, object], *, dry_run: bool) -> None:
+    prefix = "dry-run" if dry_run else "migration plan"
+    print(
+        f"{prefix} variants={report['variants']} runs={report['runs']} "
+        f"models={report['models']} artifacts={report['artifacts']}"
+    )
+    print(
+        f"bytes input={report['input_bytes']} output={report['output_bytes']} "
+        f"additional={report['estimated_additional_bytes']}"
+    )
+    print(f"plan_digest={report['plan_digest']}")
+    print(f"cutover_ready={str(report['cutover_ready']).lower()}")
+    for address in report["active_leases"]:
+        print(f"active_lease {address}")
+    for address in report["stale_nonterminal"]:
+        print(f"stale_nonterminal {address}")
+    for item in report["malformed_records"]:
+        print(f"malformed {item['path']}: {item['error']}")
+    for item in report["mlflow_identities"]:
+        print(f"mlflow {item['attempt']} {item['tracker_run_id']}")
+    for digest in report["object_hashes"]:
+        print(f"object {digest}")
+
+
+def _authoring_migration_report(report: dict[str, Any], *, dry_run: bool) -> None:
+    prefix = "dry-run" if dry_run else "authoring migration"
+    print(
+        f"{prefix} experiments={report['experiments']} "
+        f"variants={report['variants']} runs={report['runs']} "
+        f"models={report['models']} results={report['results']}"
+    )
+    print(
+        f"bytes input={report['input_bytes']} output={report['output_bytes']} "
+        f"additional={report['estimated_additional_bytes']}"
+    )
+    print(f"tracker {report['tracker_before']} -> {report['tracker_after']}")
+    if report.get("tracker_default") is not None:
+        print(
+            f"tracker_default={report['tracker_default']} (explicit; history preserved)"
+        )
+    print(f"plan_digest={report['plan_digest']}")
+    print(f"cutover_ready={str(report['cutover_ready']).lower()}")
+    for item in report["transformations"]:
+        source = item.get("source", item.get("kind", "record"))
+        print(f"transform {source} {item.get('status', 'planned')}")
+    for address in report["active_leases"]:
+        print(f"active_lease {address}")
+    for address in report["stale_nonterminal"]:
+        print(f"stale_nonterminal {address}")
+    for item in report["malformed_records"]:
+        print(f"malformed {item['path']}: {item['error']}")
+    for digest in report["object_hashes"]:
+        print(f"object {digest}")
+
+
 def _json(payload: object) -> None:
     print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+
+
+def _public_payload(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: _public_payload(item)
+            for key, item in value.items()
+            if not key.endswith("_hash")
+            and key
+            not in {
+                "before_head",
+                "binding_transaction",
+                "attempt_hashes",
+                "run_spec_hashes",
+                "event_hashes",
+                "result_hashes",
+                "blob_hashes",
+            }
+        }
+    if isinstance(value, list):
+        return [_public_payload(item) for item in value]
+    return value
+
+
+def _experiment_payload(
+    item: ExperimentRecord,
+    graph: V2Graph | None,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "name": item.document["name"],
+        "type": item.document["type"],
+        "template": {"name": item.document["template"]["name"]},
+    }
+    if graph is not None:
+        experiment_hash = graph.experiment_hash(str(item.document["name"]))
+        payload.update(
+            experiment_hash=experiment_hash,
+            experiment_revision_hash=graph.current_revision(experiment_hash),
+        )
+    return payload
+
+
+def _variant_payload(
+    item: VariantRecord,
+    graph: V2Graph | None,
+    experiment_hash: str | None,
+) -> dict[str, object]:
+    payload: dict[str, object] = {"name": item.document["name"]}
+    if graph is not None and experiment_hash is not None:
+        variant_hash = graph.variant_hash(
+            experiment_hash,
+            str(item.document["name"]),
+        )
+        payload.update(
+            variant_hash=variant_hash,
+            variant_revision_hash=graph.current_revision(variant_hash),
+        )
+    return payload
+
+
+def _short_hash(digest: str) -> str:
+    return digest.removeprefix("sha256:")[:12]
 
 
 if __name__ == "__main__":

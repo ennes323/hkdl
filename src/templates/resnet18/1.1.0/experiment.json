@@ -1,0 +1,8 @@
+{
+  "schema_version": 2,
+  "template": {
+    "name": "resnet18"
+  },
+  "type": "classification",
+  "question": "Does a ResNet18 baseline train correctly on the selected device?"
+}

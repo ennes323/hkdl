@@ -550,6 +550,14 @@ def _mlflow_tags(
         "model_id",
         "evaluation_case",
         "retry_of",
+        "experiment_hash",
+        "experiment_revision_hash",
+        "variant_hash",
+        "variant_revision_hash",
+        "option_set_hash",
+        "run_spec_hash",
+        "attempt_hash",
+        "comparison_hash",
     ):
         value = metadata.get(key)
         if value is not None:

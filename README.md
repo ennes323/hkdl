@@ -1,13 +1,13 @@
 # HKDL
 
 HKDL authors self-contained ML Variants and records immutable execution
-history. Version 1.1.5 supports authoring, multi-seed training, immutable
-Models, named evaluation cases with optional result artifacts, Variant-owned
-export, new-Run retry, brief, full, and aggregate-table status projections,
-disposable SQLite acceleration for multi-Variant status reads,
-live local metric following, Run-owned worker logs, shared locked Variant
-environments, explicit environment pruning, read-only storage reporting, shell
-completion, and opt-in MLflow tracking.
+history. Version 1.2.0 separates user-authored research JSON from mechanically
+managed identities, revisions, Run attempts, Models and results. It adds the v2
+content-addressed store, explicit legacy migration, Code/Options snapshots,
+safe rename/deletion, and a local Experiment web view with comparisons,
+learning curves, Run inspection and explicit Changes commits. Multi-seed
+training, named evaluation cases, Variant-owned export, checkpoint retry,
+local logs/metrics, shared locked environments and opt-in MLflow remain supported.
 
 An Experiment may also contain optional `docs/` and `tools/` directories for
 authored documentation and utilities. HKDL excludes these two real,
@@ -82,6 +82,37 @@ execution policy, resource limits, and reporting preferences in an optional
 root `AGENTS.user.md`; HKDL does not distribute, track, replace, migrate, or
 delete that file.
 
+### Upgrading from 1.1.5
+
+Use `hkdl update` from a public `main` checkout with an `origin` remote and no
+tracked local changes. It asks for consent, fast-forwards source and reinstalls
+the environment. It does not convert research data. Keep a complete workspace
+backup before any separately approved migration, and finish active Runs first.
+
+- Existing YAML workspaces continue using their legacy format and execution
+  history after the source update. Existing Variant source and immutable
+  Template `1.0.x` bytes are unchanged.
+- For v2 management, review `hkdl migrate --all --dry-run -o json` first.
+  Only after approving its readiness, space requirements and changes, run
+  `hkdl migrate --all` and confirm the cutover. Legacy files remain preserved.
+- For JSON authoring, separately review
+  `hkdl migrate --authoring --dry-run -o json` in the active v2 workspace.
+  Apply only the approved plan with `--authoring --yes` and optionally
+  `--expect-plan sha256:<reviewed-digest>`. See [Schema compatibility](#schema-compatibility)
+  for tracker conflicts and recovery. Never change either marker by hand.
+
+New empty workspaces using the bundled JSON Templates initialize v2 during the
+first `experiment create`; no migration command is needed. While an interrupted
+initialization is pending, ordinary operations are blocked: repeat the exact original
+`experiment create` command to resume validation/publication. Changed or
+unexpected files are preserved and stop recovery instead of being overwritten.
+If creation already completed, the normal existing-name error on a repeated
+create is expected; inspect or commit that Experiment rather than recreating it.
+
+After a v2 cutover, do not run an older HKDL against that workspace. Preserved
+legacy files alone are not a downgrade mechanism; use a separate complete
+pre-migration backup if returning to the earlier release is necessary.
+
 ## End-to-end example
 
 Create an Experiment and copy the latest Template into a Variant:
@@ -124,11 +155,16 @@ hkdl status demo baseline --output json
 with one row per Evaluation Case and metric. It is a text-only alternative to
 the brief and full hierarchy views.
 
-Range status queries may maintain `outputs/.hkdl-index.sqlite3` as a disposable
-projection. Authored Experiment/Variant files and generated Run/Model files
-remain authoritative; exact Run status continues to read its files directly.
-Missing, stale, incompatible, corrupt, or unavailable projection state falls
-back to validated files.
+Before v2 activation, range status queries may maintain
+`outputs/.hkdl-index.sqlite3` as a disposable projection of authoritative
+authored and generated files. With `.hkdl/store/CURRENT` set to `v2`, the
+separate projection is `.hkdl/store/v2/index.sqlite3`, rebuilt from immutable
+objects and bindings. Neither database is authority. V2 inspection reads the
+graph directly; captured terminal records, metrics, and logs do not require
+generated output files. Older Attempts without captured evidence retain a
+compatibility reader, and active logs/metrics still use working files. Keep
+legacy outputs unless their cleanup is separately approved; activation alone
+is not permission to remove them.
 
 ```text
 hkdl index status
@@ -139,6 +175,27 @@ hkdl index rebuild
 validates current authority, builds a sibling candidate database, and
 atomically replaces only the projection. Neither command migrates or rewrites
 authored or generated records.
+
+Inspect and commit one Experiment through its local web view:
+
+```text
+hkdl web demo
+hkdl web demo --port 8765
+```
+
+The foreground server binds only to `127.0.0.1`, prints its local URL, and
+stops on interrupt. The selected Experiment is fixed for the server lifetime;
+there is no global Experiment picker. Current authored Variants and preserved
+generated-history-only Variant identities remain visibly separate, and active
+persisted Run states do not claim process liveness. In active v2 workspaces,
+the Changes view can commit
+validated Experiment or Variant Code revisions; Options remain next-Run inputs.
+Open **View Run** to inspect captured Code/Options, one Run's learning curve,
+recorded stop reason and recent worker log. These are historical inputs, not
+the current draft; refresh remains manual and missing data is shown explicitly.
+
+The web view does not edit JSON, launch, retry, cancel, rename, delete,
+authenticate, or poll automatically.
 
 Inspect repository-owned local storage without changing it:
 
@@ -195,38 +252,72 @@ hkdl run retry demo baseline run-003
 ```
 
 The parent stays sealed and the child records `retry_of`. A valid last
-checkpoint may be used to continue training.
+checkpoint may be used to continue training. Retry preserves the captured
+research inputs; `--tracker none|local|mlflow|local+mlflow` selects tracking for
+the new attempt without editing the parent. Without an override, tracking is
+resolved from the current workspace setting for JSON authoring or the current
+Variant's tracker for legacy YAML authoring.
 
 ## Schema compatibility
 
-Authored Experiment and Variant files currently use schema version 1. Inspect
-one authored file through the stable migration boundary:
+New empty workspaces using the bundled schema-2 Templates create
+`experiment.json`, `code.json`, and `options.json`. The JSON files contain
+research inputs; names, hashes, revision history, and tracker settings are
+managed separately. Existing YAML workspaces keep schema-1 `experiment.yaml`
+and `variant.yaml` until an explicit authoring migration.
+
+There are three separate migration operations:
+
+| Operation | Scope |
+| --- | --- |
+| `hkdl migrate <path>` | Validate one legacy authored YAML file. Schema 1 is current for this single-file boundary; no rewrite is registered. |
+| `hkdl migrate --all --dry-run` | Preview importing the complete legacy workspace into v2 object authority. Apply uses `--all` with confirmation and preserves existing authored/output bytes. |
+| `hkdl migrate --authoring --dry-run` | Preview YAML-to-JSON draft conversion and historical Run/Model graph replay in an already active v2 workspace, including JSON workspaces with older graph evidence. Apply requires explicit `--authoring --yes`. |
+
+Authoring migration preserves uncommitted research edits and existing output
+bytes. It reports graph remapping, tracker/lease conflicts, space estimates,
+and a plan digest. If legacy tracker defaults disagree, explicitly select the
+future default with `--tracker-default local` (also `none`, `mlflow`, or
+`local,mlflow`). This preserves historical tracker evidence; repeat the same
+selection on apply. `--expect-plan sha256:<64hex>` on apply binds the operation
+to the reviewed digest. Apply takes a short exclusive maintenance window;
+ordinary commands return exit 5 and the web returns 503 until it completes or
+an interrupted cutover is explicitly recovered.
+
+For single-file validation:
 
 ```text
 hkdl migrate experiments/demo/experiment.yaml
 hkdl migrate experiments/demo/baseline/variant.yaml
 ```
 
-Version 1 is already current, so these commands validate the file and do not
-rewrite it. No migration path is registered yet. Unsupported schema versions
-fail without changing the target. Generated Run and Model records are immutable
-and cannot be migrated in place.
+`CURRENT` selects v2 storage authority; the separate
+`.hkdl/store/AUTHORING_CURRENT` marker selects JSON authoring. A workspace can
+have v2 storage while still authoring YAML. Do not edit either marker manually
+or infer that output files are disposable from its presence. Review migration
+readiness, blockers, and the reported changes before applying. Unsupported
+single-file schema versions fail without changing the target; generated Run
+and Model records cannot be migrated in place by `migrate <path>`.
 
 ## ResNet18 fixtures
 
-`resnet18@1.0.1` includes the attributed small TF-Flowers JPEG fixture, two
-evaluation cases (`default` and `daisy-only`), prediction result output, ONNX
+`resnet18@1.1.0` supplies schema-2 JSON authoring and includes the attributed
+small TF-Flowers JPEG fixture, two evaluation cases (`default` and `daisy-only`),
+prediction result output, ONNX
 export support, checkpoint continuation, and optional MLflow dependencies.
 It records loss and per-batch wall time and performs no dataset or
-pretrained-weight download at runtime. The immutable `1.0.0` remains available.
+pretrained-weight download at runtime. Immutable `1.0.0` and `1.0.1` remain
+available for legacy authoring.
 
 ## YOLO26n object detection
 
-`yolo26n@1.0.1` includes a deterministic synthetic shapes dataset with eight
-training images, four validation images, and two classes (`circle` and
+`yolo26n@1.1.0` supplies schema-2 JSON authoring and includes a deterministic
+synthetic shapes dataset with eight training images, four validation images,
+and two classes (`circle` and
 `rectangle`). It trains the architecture from scratch for ten epochs and
 records loss and per-epoch wall time. It performs no dataset or
-pretrained-weight download at runtime. The immutable `1.0.0` remains available.
+pretrained-weight download at runtime. Immutable `1.0.0` and `1.0.1` remain
+available for legacy authoring.
 
 ```text
 hkdl experiment create detection --template yolo26n
@@ -243,8 +334,19 @@ tracking integrations are disabled. HKDL remains the only tracking owner.
 
 ## Tracking
 
-New bundled `1.0.1` Variants default to `tracker.backend: local`. Training
-scalars, including `train.batch_seconds` for ResNet18 and
+For JSON authoring, the workspace default is stored in `.hkdl/settings.json`;
+an absent settings file means `local`. Inspect or change it with:
+
+```text
+hkdl settings show
+hkdl settings tracker set local
+```
+
+`run train` and `run retry` accept `--tracker` to override that default for one
+invocation. Eval and Export use the workspace default. Legacy YAML Variants
+instead keep `tracker.backend` in `variant.yaml`, with bundled `1.0.1` Variants
+defaulting to `local`. Tracker settings do not belong in schema-2 Code/Options.
+Training scalars, including `train.batch_seconds` for ResNet18 and
 `train.epoch_seconds` for YOLO26n, are stored with the Run and can be inspected
 with:
 
@@ -262,8 +364,10 @@ Follow prints existing metric rows, then newly completed rows until the Run
 becomes terminal. It remains a read-only local view: JSON streaming, progress
 percentages, ETA, and MLflow history polling are not provided.
 
-Use `tracker.backend: none` to disable tracking, `mlflow` for MLflow only, or
-`[local, mlflow]` for both. MLflow requires an external `MLFLOW_TRACKING_URI`.
+The settings command and `--tracker` accept `none`, `local`, `mlflow`, or
+`local+mlflow`. In legacy YAML use `tracker.backend: none` to disable tracking,
+`mlflow` for MLflow only, or `[local, mlflow]` for both. MLflow requires an
+external `MLFLOW_TRACKING_URI`.
 Every local execution Run gets a distinct external Run. Retry uses a new
 external identity with parent relation tags. HKDL does not start or manage an
 MLflow server.

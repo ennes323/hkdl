@@ -12,6 +12,14 @@ from .run_contracts import validate_tracker
 from .runs import ModelRecord, RunRecord, RunStore
 from .status_index import IndexReport, StatusIndex, VariantInventory
 from .storage import RepositoryPaths
+from .v2.execution import GraphRecorder
+from .v2.projection import SCHEMA_VERSION, GraphProjection, ProjectionReport
+from .v2.reader import graph_observation
+from .v2.graph import (
+    CURRENT_REVISION_NAME,
+    entity_revision_scope,
+    workspace_experiment_scope,
+)
 
 
 class Status:
@@ -22,41 +30,78 @@ class Status:
         now: Callable[[], datetime] | None = None,
     ):
         self.store = RunStore(repository)
+        self.graph = GraphRecorder(repository)
         self._now = now or (lambda: datetime.now(timezone.utc))
 
+    @graph_observation
     def query(
         self,
         *,
         experiment: str | None = None,
         variant: str | None = None,
         run_id: str | None = None,
+        include_identities: bool = False,
     ) -> dict[str, Any]:
         if variant is not None and experiment is None:
             raise ContractError("Variant status filter requires Experiment")
         observed_at = self._observed_at()
+        graph_active = self.graph.active()
         if run_id is not None:
             if experiment is None or variant is None:
                 raise ContractError("Run status filter requires Experiment and Variant")
-            records = [self.store.load(experiment, variant, run_id)]
-            return self._tree(
+            record = self.store.load(experiment, variant, run_id)
+            records = [record]
+            result = self._tree(
                 records,
                 include_all_models=False,
                 observed_at=observed_at,
             )
-        return StatusIndex(self.store.repository).query(
+            return result if include_identities else _without_identities(result)
+        if graph_active:
+            records = self.store.scan(experiment=experiment, variant=variant)
+            result = self._tree(
+                records,
+                include_all_models=True,
+                observed_at=observed_at,
+            )
+            return result if include_identities else _without_identities(result)
+        result = StatusIndex(self.store.repository).query(
             experiment=experiment,
             variant=variant,
             observed_at=observed_at,
             load=lambda inventory: self._project_variant(inventory, observed_at),
         )
+        return result if include_identities else _without_identities(result)
 
     def index_status(self) -> IndexReport:
+        if self.graph.active():
+            return self._v2_index_report(GraphProjection(self.graph.graph).inspect())
         return StatusIndex(self.store.repository).inspect()
 
     def rebuild_index(self) -> IndexReport:
+        if self.graph.active():
+            return self._v2_index_report(GraphProjection(self.graph.graph).rebuild())
         observed_at = self._observed_at()
         return StatusIndex(self.store.repository).rebuild(
             lambda inventory: self._project_variant(inventory, observed_at)
+        )
+
+    def _v2_index_report(self, report: ProjectionReport) -> IndexReport:
+        counts = defaultdict(int)
+        for record in self.graph.graph.store.iter_records():
+            counts[record.kind] += 1
+        return IndexReport(
+            state=report.state,
+            path=str(
+                GraphProjection(self.graph.graph).path.relative_to(
+                    self.store.repository.root
+                )
+            ),
+            schema_version=SCHEMA_VERSION,
+            variants=counts["variant"],
+            runs=counts["attempt"],
+            models=counts["model"],
+            detail=report.detail,
         )
 
     def _observed_at(self) -> datetime:
@@ -93,6 +138,7 @@ class Status:
         include_all_models: bool,
         observed_at: datetime,
     ) -> dict[str, Any]:
+        graph_active = self.graph.active()
         by_variant: dict[tuple[str, str], list[RunRecord]] = defaultdict(list)
         for record in records:
             by_variant[
@@ -113,6 +159,18 @@ class Status:
                 experiment,
                 {"name": experiment, "variants": []},
             )
+            if graph_active:
+                experiment_node["experiment_hash"] = self.store.graph_reader().resolve(
+                    workspace_experiment_scope(), experiment
+                )
+            variant_hash = None
+            variant_revision_hash = None
+            if graph_active:
+                reader = self.store.graph_reader()
+                _, variant_hash = reader.entities(experiment, variant)
+                variant_revision_hash = reader.resolve(
+                    entity_revision_scope(variant_hash), CURRENT_REVISION_NAME
+                )
             all_models = self.store.scan_model_manifests(
                 experiment=experiment,
                 variant=variant,
@@ -137,7 +195,7 @@ class Status:
             for model in all_models:
                 self._seed_node(groups, model.document["training_group"], model)[
                     "model"
-                ] = _model_summary(model)
+                ] = self._model_summary(model)
             for record in variant_runs:
                 group, seed = _run_group_seed(record, model_by_id)
                 seed_node = self._seed_node(
@@ -161,12 +219,16 @@ class Status:
                         "aggregates": _aggregates(seeds),
                     }
                 )
-            experiment_node["variants"].append(
-                {
-                    "name": variant,
-                    "training_groups": group_documents,
-                }
-            )
+            variant_node = {
+                "name": variant,
+                "training_groups": group_documents,
+            }
+            if graph_active:
+                variant_node.update(
+                    variant_hash=variant_hash,
+                    variant_revision_hash=variant_revision_hash,
+                )
+            experiment_node["variants"].append(variant_node)
         return {"experiments": list(experiments.values())}
 
     @staticmethod
@@ -224,7 +286,7 @@ class Status:
             0,
             int((end - _parse_timestamp(created_at)).total_seconds()),
         )
-        return {
+        summary = {
             "run_id": record.request["run_id"],
             "action": record.request["action"],
             "status": record.state["status"],
@@ -250,6 +312,33 @@ class Status:
             "best_checkpoint": record.state["best_checkpoint"],
             "last_checkpoint": record.state["last_checkpoint"],
         }
+        if self.graph.active():
+            summary.update(self.graph.identity(record).as_dict())
+        return summary
+
+    def _model_summary(self, model: ModelRecord) -> dict[str, Any]:
+        summary = _model_summary(model)
+        if self.graph.active():
+            summary["model_hash"] = model.graph_hash or self.graph.model_hash(
+                str(model.document["experiment"]),
+                str(model.document["variant"]),
+                str(model.document["model_id"]),
+            )
+        return summary
+
+
+def _without_identities(value: Any) -> Any:
+    """Remove content-addressed implementation identities from normal views."""
+
+    if isinstance(value, dict):
+        return {
+            key: _without_identities(item)
+            for key, item in value.items()
+            if not key.endswith("_hash")
+        }
+    if isinstance(value, list):
+        return [_without_identities(item) for item in value]
+    return value
 
 
 def render_status_tree(document: dict[str, Any], *, full: bool = False) -> str:

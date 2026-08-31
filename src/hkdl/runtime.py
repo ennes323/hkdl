@@ -356,10 +356,19 @@ class VariantRuntime:
                 with self._lease_lock:
                     descriptors = self._lease_descriptors.get(python, [])
                     environment_descriptor = descriptors[-1] if descriptors else None
+            from .v2.maintenance import workspace_descriptor
+            from .v2.leases import inherited_leases
+
+            maintenance_descriptor = workspace_descriptor(variant.path.parents[2])
             pass_fds = tuple(
                 dict.fromkeys(
                     descriptor
-                    for descriptor in (lock_descriptor, environment_descriptor)
+                    for descriptor in (
+                        lock_descriptor,
+                        environment_descriptor,
+                        maintenance_descriptor,
+                        *inherited_leases(),
+                    )
                     if descriptor is not None
                 )
             )

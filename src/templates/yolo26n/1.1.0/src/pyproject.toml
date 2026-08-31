@@ -1,0 +1,19 @@
+[project]
+name = "hkdl-template-yolo26n"
+version = "1.0.0"
+license = "AGPL-3.0-or-later"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "onnx==1.22.0",
+  "onnxscript==0.7.1",
+  "torch==2.13.0",
+  "torchvision==0.28.0",
+  "ultralytics==8.4.113",
+]
+
+[project.optional-dependencies]
+mlflow = [
+  "alembic==1.18.5",
+  "mlflow-skinny[db]==3.14.0",
+  "sqlalchemy==2.0.51",
+]

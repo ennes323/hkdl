@@ -1,0 +1,89 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hkdl.local/templates/resnet18/1.1.0/options.schema.json",
+  "title": "HKDL ResNet18 1.1.0 options",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "dataset", "metrics", "train", "eval", "infer"],
+  "properties": {
+    "schema_version": {
+      "const": 2
+    },
+    "dataset": {
+      "type": "object",
+      "required": ["kind", "train_dir", "eval_dir", "image_size", "classes"],
+      "properties": {
+        "kind": {"type": "string"},
+        "train_dir": {"type": "string"},
+        "eval_dir": {"type": "string"},
+        "image_size": {
+          "type": "array",
+          "prefixItems": [
+            {"type": "integer", "minimum": 1},
+            {"type": "integer", "minimum": 1},
+            {"type": "integer", "minimum": 1}
+          ],
+          "minItems": 3,
+          "maxItems": 3,
+          "items": false
+        },
+        "classes": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1},
+          "minItems": 1
+        }
+      },
+      "additionalProperties": true
+    },
+    "metrics": {
+      "type": "object",
+      "required": ["primary", "report"],
+      "properties": {
+        "primary": {"type": "string", "minLength": 1},
+        "report": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1},
+          "minItems": 1
+        }
+      },
+      "additionalProperties": true
+    },
+    "train": {
+      "type": "object",
+      "required": ["steps", "batch_size", "learning_rate"],
+      "properties": {
+        "steps": {"type": "integer", "minimum": 1},
+        "batch_size": {"type": "integer", "minimum": 1},
+        "learning_rate": {"type": "number", "exclusiveMinimum": 0},
+        "hyp": {"type": "object"}
+      },
+      "additionalProperties": true
+    },
+    "eval": {
+      "type": "object",
+      "required": ["cases"],
+      "properties": {
+        "cases": {
+          "type": "object",
+          "minProperties": 1,
+          "additionalProperties": {"type": "object"}
+        }
+      },
+      "additionalProperties": true
+    },
+    "infer": {
+      "type": "object",
+      "required": ["format", "opset_version", "input_shape"],
+      "properties": {
+        "format": {"type": "string", "minLength": 1},
+        "opset_version": {"type": "integer", "minimum": 1},
+        "input_shape": {
+          "type": "array",
+          "items": {"type": "integer", "minimum": 1},
+          "minItems": 1
+        }
+      },
+      "additionalProperties": true
+    }
+  }
+}

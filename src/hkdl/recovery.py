@@ -51,9 +51,11 @@ class Recovery:
         experiment: str,
         variant: str,
         run_id: str,
+        *,
+        tracker: str | None = None,
     ) -> RunRecord:
         try:
-            return self.execution.retry(experiment, variant, run_id)
+            return self.execution.retry(experiment, variant, run_id, tracker=tracker)
         except ExecutionInterrupted as error:
             raise RecoveryInterrupted(error.address) from error
         except ExecutionFailure as error:

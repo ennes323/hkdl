@@ -17,6 +17,16 @@ from .authoring import RESERVED_VARIANT_NAMES
 from .config import NAME_PATTERN, VERSION_PATTERN, ContractError, load_yaml_file
 from .run_contracts import MAX_SEED, MODEL_ID_PATTERN, RUN_ID_PATTERN
 from .storage import RepositoryPaths, validate_repository_root
+from .storage import NotFoundError
+from .v2.graph import (
+    V2Graph,
+    workspace_experiment_scope,
+    experiment_variant_scope,
+    variant_run_scope,
+    variant_model_scope,
+)
+from .v2.reader import GraphReader
+from .v2.maintenance import WorkspaceBusy, workspace_access
 
 SHELLS = ("bash", "zsh")
 DEVICES = ("auto", "cpu", "mps", "cuda")
@@ -64,7 +74,9 @@ def complete_template_versions(
         return []
 
     def candidates(repository: RepositoryPaths) -> Iterable[str]:
-        document = _yaml(repository.experiments / experiment / "experiment.yaml")
+        document = _authored(
+            repository.experiments / experiment, "experiment.yaml", "experiment.json"
+        )
         template = document.get("template") if document else None
         family = template.get("name") if isinstance(template, dict) else None
         if not _name(family):
@@ -78,7 +90,15 @@ def complete_template_versions(
 
 
 def complete_experiments(*, prefix: str, **_: Any) -> list[str]:
-    return _complete(prefix, lambda repository: _names(repository.experiments))
+    def candidates(repository):
+        reader = _graph(repository)
+        return (
+            reader.names(workspace_experiment_scope())
+            if reader
+            else _names(repository.experiments)
+        )
+
+    return _complete(prefix, candidates)
 
 
 def complete_variants(
@@ -117,6 +137,17 @@ def complete_training_groups(
         return []
 
     def candidates(repository: RepositoryPaths) -> Iterable[str]:
+        reader = _graph(repository)
+        if reader is not None:
+            groups = {
+                record.request["target"].get("training_group")
+                for record in reader.runs(experiment=experiment, variant=variant)
+            }
+            groups.update(
+                model.document["training_group"]
+                for model in reader.models(experiment, variant)
+            )
+            return {group for group in groups if _name(group)}
         root = repository.outputs / experiment / variant
         groups: set[str] = set()
         for run_id in _names(root / "runs", pattern=RUN_ID_PATTERN.fullmatch):
@@ -144,7 +175,11 @@ def complete_evaluation_cases(
         return []
 
     def candidates(repository: RepositoryPaths) -> Iterable[str]:
-        document = _yaml(repository.experiments / experiment / variant / "variant.yaml")
+        document = _authored(
+            repository.experiments / experiment / variant,
+            "variant.yaml",
+            "options.json",
+        )
         evaluation = document.get("eval") if document else None
         if not isinstance(evaluation, dict):
             return ()
@@ -168,6 +203,13 @@ def complete_eval_seeds(
         return []
 
     def candidates(repository: RepositoryPaths) -> Iterable[str]:
+        reader = _graph(repository)
+        if reader is not None:
+            return {"all"} | {
+                str(model.document["seed"])
+                for model in reader.models(experiment, variant)
+                if model.document["training_group"] == group
+            }
         models = repository.outputs / experiment / variant / "models"
         seeds = {"all"}
         for model_id in _names(models, pattern=MODEL_ID_PATTERN.fullmatch):
@@ -189,13 +231,18 @@ def complete_eval_seeds(
 def _variants(prefix: str, experiment: object) -> list[str]:
     if not _name(experiment):
         return []
-    return _complete(
-        prefix,
-        lambda repository: _names(
+
+    def candidates(repository):
+        reader = _graph(repository)
+        if reader is not None:
+            entity = reader.resolve(workspace_experiment_scope(), experiment)
+            return reader.names(experiment_variant_scope(entity))
+        return _names(
             repository.experiments / experiment,
             excluded=RESERVED_VARIANT_NAMES | {"notes"},
-        ),
-    )
+        )
+
+    return _complete(prefix, candidates)
 
 
 def _owned_names(
@@ -208,13 +255,35 @@ def _owned_names(
     variant = getattr(parsed_args, "variant", None)
     if not _name(experiment) or not _name(variant):
         return []
-    return _complete(
-        prefix,
-        lambda repository: _names(
+
+    def candidates(repository):
+        reader = _graph(repository)
+        if reader is not None:
+            _, entity = reader.entities(experiment, variant)
+            scope = (
+                variant_run_scope(entity)
+                if catalog == "runs"
+                else variant_model_scope(entity)
+            )
+            return reader.names(scope)
+        return _names(
             repository.outputs / experiment / variant / catalog,
             pattern=pattern,
-        ),
-    )
+        )
+
+    return _complete(prefix, candidates)
+
+
+def _graph(repository: RepositoryPaths) -> GraphReader | None:
+    return GraphReader(repository) if V2Graph(repository).is_active() else None
+
+
+def _authored(root: Path, legacy: str, current: str) -> dict[str, Any] | None:
+    if os.path.lexists(root / legacy) and os.path.lexists(root / current):
+        return None
+    if os.path.lexists(root / current):
+        return _json(root / current)
+    return _yaml(root / legacy)
 
 
 def _complete(
@@ -223,12 +292,20 @@ def _complete(
 ) -> list[str]:
     try:
         repository = validate_repository_root()
-        values = candidates(repository)
-        return sorted(
-            {value for value in values if value.startswith(prefix)},
-            key=lambda value: value.encode("utf-8"),
-        )
-    except (ContractError, OSError, TypeError, ValueError):
+        with workspace_access(repository):
+            values = candidates(repository)
+            return sorted(
+                {value for value in values if value.startswith(prefix)},
+                key=lambda value: value.encode("utf-8"),
+            )
+    except (
+        WorkspaceBusy,
+        ContractError,
+        NotFoundError,
+        OSError,
+        TypeError,
+        ValueError,
+    ):
         return []
 
 

@@ -1,0 +1,16 @@
+{
+  "schema_version": 2,
+  "template": {
+    "name": "yolo26n",
+    "version": "1.1.0"
+  },
+  "components": {
+    "dataloader": "yolo",
+    "evaluator": "default",
+    "exporter": "onnx",
+    "loss": "ultralytics",
+    "model": "yolo26n",
+    "optimizer": "sgd",
+    "trainer": "default"
+  }
+}

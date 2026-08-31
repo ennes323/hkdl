@@ -23,6 +23,13 @@ from .config import (
 )
 from .filesystem import lock_directory as _raw_lock_directory
 from .filesystem import unlock_directory as _raw_unlock_directory
+from .research_json import (
+    load_json_file,
+    load_options_schema,
+    validate_code_json,
+    validate_experiment_json,
+    validate_options_json,
+)
 
 
 class AlreadyExistsError(ContractError):
@@ -59,6 +66,10 @@ class ResolvedTemplate:
     experiment_seed: dict[str, object]
     variant_seed: dict[str, object]
     bundle_digest: str
+    authoring_schema_version: int = 1
+    code_seed: dict[str, object] | None = None
+    options_seed: dict[str, object] | None = None
+    options_schema: dict[str, object] | None = None
 
 
 def storage_usage(repository: RepositoryPaths) -> dict[str, int]:
@@ -171,10 +182,42 @@ class TemplateResolver:
             expected_version=version,
         )
         validate_locked_source_tree(bundle / "src")
-        experiment_seed = load_yaml_file(bundle / "experiment.yaml")
-        validate_template_experiment_seed(experiment_seed, manifest)
-        variant_seed = load_yaml_file(bundle / "variant.yaml")
-        validate_template_variant_seed(variant_seed)
+        if os.path.lexists(bundle / "experiment.json"):
+            experiment_json = load_json_file(bundle / "experiment.json")
+            code_seed = load_json_file(bundle / "code.json")
+            options_seed = load_json_file(bundle / "options.json")
+            options_schema = load_options_schema(bundle / "options.schema.json")
+            validate_experiment_json(experiment_json)
+            validate_code_json(code_seed)
+            validate_options_json(options_seed, options_schema)
+            if experiment_json["type"] != manifest["type"]:
+                raise ContractError("Template JSON seed type does not match template")
+            if code_seed["template"] != {
+                "name": manifest["name"],
+                "version": manifest["version"],
+            }:
+                raise ContractError("Template Code seed provenance is invalid")
+            experiment_seed = experiment_json
+            variant_seed = {
+                "schema_version": 1,
+                "dataset": options_seed["dataset"],
+                "metrics": options_seed["metrics"],
+                "tracker": {"backend": "local"},
+                "components": code_seed["components"],
+                "train": options_seed["train"],
+                "eval": options_seed["eval"],
+                "infer": options_seed["infer"],
+            }
+            authoring_schema_version = 2
+        else:
+            experiment_seed = load_yaml_file(bundle / "experiment.yaml")
+            validate_template_experiment_seed(experiment_seed, manifest)
+            variant_seed = load_yaml_file(bundle / "variant.yaml")
+            validate_template_variant_seed(variant_seed)
+            code_seed = None
+            options_seed = None
+            options_schema = None
+            authoring_schema_version = 1
         bundle_digest = compute_bundle_digest(bundle)
         return ResolvedTemplate(
             bundle,
@@ -182,6 +225,10 @@ class TemplateResolver:
             experiment_seed,
             variant_seed,
             bundle_digest,
+            authoring_schema_version,
+            code_seed,
+            options_seed,
+            options_schema,
         )
 
     def latest(self, name: str) -> ResolvedTemplate:
@@ -244,7 +291,19 @@ def compute_bundle_digest(bundle: Path) -> str:
     """Hash the complete fixed-shape Template Bundle."""
 
     _require_directory(bundle)
-    expected = {"template.yaml", "experiment.yaml", "variant.yaml", "src"}
+    schema_two = os.path.lexists(bundle / "experiment.json")
+    expected = (
+        {
+            "template.yaml",
+            "experiment.json",
+            "code.json",
+            "options.json",
+            "options.schema.json",
+            "src",
+        }
+        if schema_two
+        else {"template.yaml", "experiment.yaml", "variant.yaml", "src"}
+    )
     actual: set[str] = set()
     for entry in os.scandir(bundle):
         if entry.is_symlink():
@@ -252,12 +311,23 @@ def compute_bundle_digest(bundle: Path) -> str:
         actual.add(entry.name)
     if actual != expected:
         raise ContractError("Template Bundle entries are invalid")
-    for name in ("template.yaml", "experiment.yaml", "variant.yaml"):
+    authored_names = (
+        (
+            "template.yaml",
+            "experiment.json",
+            "code.json",
+            "options.json",
+            "options.schema.json",
+        )
+        if schema_two
+        else ("template.yaml", "experiment.yaml", "variant.yaml")
+    )
+    for name in authored_names:
         _require_regular_file(bundle / name)
     _require_directory(bundle / "src")
     files = [
         (Path(name).as_posix().encode("utf-8"), bundle / name)
-        for name in ("template.yaml", "experiment.yaml", "variant.yaml")
+        for name in authored_names
     ]
     for relative_bytes, path in _collect_regular_files(bundle / "src"):
         files.append((b"src/" + relative_bytes, path))

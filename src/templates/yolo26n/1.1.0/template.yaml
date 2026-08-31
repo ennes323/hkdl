@@ -1,0 +1,4 @@
+schema_version: 1
+name: yolo26n
+version: 1.1.0
+type: object_detection

@@ -42,6 +42,7 @@ class Training:
         *,
         seed: int = 0,
         device: str = "auto",
+        tracker: str | None = None,
     ) -> RunRecord:
         try:
             return self.execution.train(
@@ -50,6 +51,7 @@ class Training:
                 training_group,
                 seed=seed,
                 device=device,
+                tracker=tracker,
             )
         except ExecutionInterrupted as error:
             raise TrainingInterrupted(error.address) from error

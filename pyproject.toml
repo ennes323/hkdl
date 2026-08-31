@@ -1,11 +1,12 @@
 [project]
 name = "hkdl"
-version = "1.1.5"
+version = "1.2.0"
 description = "Local experiment management control plane"
 license = "MIT"
 requires-python = ">=3.12,<3.13"
 dependencies = [
   "argcomplete>=3.7,<4",
+  "jsonschema>=4.23,<5",
   "PyYAML>=6.0.2,<7",
 ]
 
