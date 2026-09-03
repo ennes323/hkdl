@@ -1,13 +1,23 @@
 # HKDL
 
 HKDL authors self-contained ML Variants and records immutable execution
-history. Version 1.2.0 separates user-authored research JSON from mechanically
+history. The 1.2 release line separates user-authored research JSON from mechanically
 managed identities, revisions, Run attempts, Models and results. It adds the v2
 content-addressed store, explicit legacy migration, Code/Options snapshots,
 safe rename/deletion, and a local Experiment web view with comparisons,
 learning curves, Run inspection and explicit Changes commits. Multi-seed
 training, named evaluation cases, Variant-owned export, checkpoint retry,
 local logs/metrics, shared locked environments and opt-in MLflow remain supported.
+
+Version 1.2.1 completes the scope originally intended for 1.2.0, whose JSON
+authoring release was prioritized. It includes the refined Experiment/Variant
+web layout and multiple metric charts with shared Run selection, explicit loss
+overlay, and quieter refresh feedback. It also adds recoverable whole-Experiment
+and whole-Variant deletion and one-sided committed Variant Code promotion.
+These are explicit CLI operations; updating does not run them automatically.
+This is a release-specific patch-numbering decision, not a claim that the
+release contains bug fixes only. Broader web editing is planned for the 1.3 line
+and is not included here; existing Changes commit controls remain available.
 
 An Experiment may also contain optional `docs/` and `tools/` directories for
 authored documentation and utilities. HKDL excludes these two real,
@@ -82,7 +92,20 @@ execution policy, resource limits, and reporting preferences in an optional
 root `AGENTS.user.md`; HKDL does not distribute, track, replace, migrate, or
 delete that file.
 
-### Upgrading from 1.1.5
+### Upgrading from 1.2.0
+
+Use `hkdl update` from a clean public `main` checkout. Version 1.2.1 reinstalls
+Core without an automatic schema migration. Existing legacy YAML, v2 YAML and
+v2 JSON workspaces retain their authored data, recorded history and immutable
+Template/Variant source. No new dependency or Template bundle version is needed.
+Keep the usual workspace backup; update is not a downgrade or recovery tool.
+
+The direct-update verification for this candidate targets 1.2.0. Older versions
+should first follow their verified transition to 1.2.0; the previously verified
+1.1.5-to-1.2.0 path is described below. This does not claim a tested direct jump
+from 1.1.5 or 1.0.x to 1.2.1.
+
+### Legacy upgrade: 1.1.5 to 1.2.0
 
 Use `hkdl update` from a public `main` checkout with an `origin` remote and no
 tracked local changes. It asks for consent, fast-forwards source and reinstalls
@@ -257,6 +280,82 @@ research inputs; `--tracker none|local|mlflow|local+mlflow` selects tracking for
 the new attempt without editing the parent. Without an override, tracking is
 resolved from the current workspace setting for JSON authoring or the current
 Variant's tracker for legacy YAML authoring.
+
+## Delete a Variant
+
+Preview the complete Variant-owned closure first:
+
+```text
+hkdl variant delete demo baseline --dry-run
+```
+
+The command removes only the selected Variant's active binding closure and
+moves its current authored root plus every output root retained under current
+or historical Experiment and Variant names to recoverable transaction trash.
+Its parent Experiment, sibling Variants, immutable CAS and derivation history,
+shared environments, and external MLflow state remain. Every owned Run must be
+terminal and lease-free, and the deleted Variant's historical names cannot be
+claimed by a different Variant entity.
+
+When active child Variants exist, dry-run returns exit 5 and lists every direct
+and transitive descendant. A normal invocation strongly recommends deleting or
+reorganizing those children first. HKDL can continue their active lineage around
+the deleted Variant without rewriting immutable derivation history, but doing so
+requires a dedicated `[y/N]` approval before the separate final deletion
+confirmation. Declining the lineage step returns exit 5 without asking the final
+question; declining only the final deletion question is a normal cancellation.
+There is no `--yes` bypass. Any changed child set, binding HEAD, owned closure or
+lease after confirmation rejects the operation without silent expansion.
+
+## Promote Variant Code
+
+Promote committed Code from a validated Source Variant into an unchanged Target
+Variant while keeping the Target identity and Options:
+
+```text
+hkdl variant promote demo tuned --to baseline --dry-run
+hkdl variant promote demo tuned --to baseline
+```
+
+Promotion copies the Source's committed `code.json` meaning and complete `src/`
+tree into a new Target revision. The Target `options.json`, Source Variant,
+Runs, Models and per-Run OptionSets remain unchanged. Source must derive from
+Target, or continue from a Source revision previously promoted into Target, and
+Target Code must not have changed from that integration point. Dirty drafts,
+unrelated lineage, Target divergence and active Target Run or Model bindings
+return exit 5 before prompting. Source executions do not block.
+
+Dry-run is read-only. A ready apply shows the exact Code delta and asks one
+`[y/N]` question; there is no `--yes` bypass. Promotion is journaled around the
+binding HEAD, so pre-HEAD failure restores the old Target and post-HEAD recovery
+completes the already-confirmed result. The Source is never deleted
+automatically; validate the promoted Target and use `variant delete` separately
+when the Source should be retired. Full three-way conflict resolution, Options
+merge, cross-Experiment promotion and Experiment merge are not supported.
+
+## Delete an Experiment
+
+Preview the complete deletion closure first:
+
+```text
+hkdl experiment delete demo --dry-run
+```
+
+Run the command without `--dry-run` to see the same plan and answer the final
+`[y/N]` question. Experiment deletion is intentionally all-or-nothing and has
+no `--yes` bypass. Any nonterminal Run or held Run lease blocks the operation;
+HKDL reports every blocker with its persisted status, lease state, reason, and
+next action before returning exit 5 without prompting.
+
+On confirmation, HKDL revalidates the exact plan, moves the current authored
+Experiment root and all output roots retained under its current or historical
+names to recoverable transaction trash, and removes the selected Experiment's
+active bindings in one transaction. Other Experiments, immutable CAS objects
+and blobs, binding history, shared environments, and external MLflow state are
+preserved. The deleted Experiment name remains retired and cannot be reused.
+If a confirmed deletion is interrupted, repeat the same non-dry-run command;
+HKDL rolls back unpublished work or completes an already-published deletion
+before starting any new plan.
 
 ## Schema compatibility
 

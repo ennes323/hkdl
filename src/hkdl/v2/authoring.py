@@ -199,6 +199,11 @@ class V2Authoring:
         variant_hash = self.graph.bindings.resolve(scope, old_name)
         if new_name in self.graph.bindings.names(scope):
             raise AlreadyExistsError(f"Variant already exists: {experiment}/{new_name}")
+        historical_target = self.graph.bindings.historical_target(scope, new_name)
+        if historical_target is not None and historical_target != variant_hash:
+            raise AlreadyExistsError(
+                f"Variant name is retained in binding history: {new_name}"
+            )
         target = experiment_record.path / new_name
         if os.path.lexists(target):
             raise AlreadyExistsError(

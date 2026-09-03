@@ -108,6 +108,7 @@ class Authoring:
         target = experiments / name
         if os.path.lexists(target):
             raise AlreadyExistsError(f"Experiment already exists: {name}")
+        _check_experiment_creation(self, name)
         template = self.templates.latest(template_name)
         document = {
             "schema_version": 1,
@@ -591,6 +592,18 @@ def _commit_created_experiment(authoring: Authoring, record: ExperimentRecord) -
     graph = V2Graph(authoring.repository)
     if graph.is_active():
         graph.commit_experiment(record)
+
+
+def _check_experiment_creation(authoring: Authoring, name: str) -> None:
+    from .v2.graph import V2Graph, workspace_experiment_scope
+
+    graph = V2Graph(authoring.repository)
+    if not graph.is_active():
+        return
+    if graph.bindings.historical_target(workspace_experiment_scope(), name) is not None:
+        raise AlreadyExistsError(
+            f"Experiment name is retained in binding history: {name}"
+        )
 
 
 def _check_variant_creation(

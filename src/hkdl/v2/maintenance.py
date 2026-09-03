@@ -16,6 +16,7 @@ from pathlib import Path
 
 JOURNAL = ".hkdl/store/authoring-migration.json"
 BOOTSTRAP_JOURNAL = ".hkdl/store/bootstrap.json"
+PROMOTION_JOURNAL = ".hkdl/store/variant-promotion.json"
 _ACCESS: ContextVar[dict[str, tuple[int, bool]]] = ContextVar(
     "hkdl_workspace_access", default={}
 )
@@ -31,7 +32,14 @@ def workspace_descriptor(root: Path) -> int | None:
 
 
 @contextmanager
-def workspace_access(repository, *, exclusive=False, recovery=False, bootstrap=False):
+def workspace_access(
+    repository,
+    *,
+    exclusive=False,
+    recovery=False,
+    bootstrap=False,
+    promotion=False,
+):
     root = repository.root
     key = str(root)
     current = _ACCESS.get()
@@ -61,6 +69,11 @@ def workspace_access(repository, *, exclusive=False, recovery=False, bootstrap=F
             raise WorkspaceBusy(
                 "workspace initialization needs recovery; repeat the original "
                 "hkdl experiment create command"
+            )
+        if not promotion and os.path.lexists(root / PROMOTION_JOURNAL):
+            raise WorkspaceBusy(
+                "Variant promotion needs recovery; repeat the original "
+                "hkdl variant promote command"
             )
         token = _ACCESS.set({**current, key: (descriptor, exclusive)})
         yield descriptor

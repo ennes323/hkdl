@@ -62,9 +62,23 @@ from .v2.authoring_migration import (
     AuthoringMigration,
     AuthoringMigrationConflict,
 )
-from .v2.deletion import DeletionConflict, RunDeletionService
+from .v2.deletion import (
+    DeletionConflict,
+    DeletionFailure,
+    ExperimentDeletionPlan,
+    ExperimentDeletionService,
+    RunDeletionService,
+    VariantDeletionPlan,
+    VariantDeletionService,
+)
 from .v2.graph import DirtyDraftError
 from .v2.graph import V2Graph
+from .v2.promotion import (
+    PromotionConflict,
+    PromotionFailure,
+    VariantPromotionPlan,
+    VariantPromotionService,
+)
 from .v2.execution import GraphRecorder
 from .v2.migration import MigrationConflict, WorkspaceMigration
 from .v2.maintenance import WorkspaceBusy, workspace_access
@@ -114,7 +128,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.noun == "experiment" and args.verb == "create"
         ):
             return _dispatch(args)
-        with workspace_access(validate_repository_root()):
+        promotion_recovery = (
+            args.noun == "variant" and args.verb == "promote" and not args.dry_run
+        )
+        with workspace_access(
+            validate_repository_root(),
+            exclusive=promotion_recovery,
+            promotion=promotion_recovery,
+        ):
             return _dispatch(args)
     except WorkspaceBusy as error:
         print(f"error: {error}", file=sys.stderr)
@@ -164,6 +185,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     except DeletionConflict as error:
         print(f"error: {error}", file=sys.stderr)
         return 5
+    except DeletionFailure as error:
+        print(f"error: {error}", file=sys.stderr)
+        if error.journal is not None:
+            print(f"recovery journal: {error.journal}", file=sys.stderr)
+        return 6
+    except PromotionConflict as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 5
+    except PromotionFailure as error:
+        print(f"error: {error}", file=sys.stderr)
+        if error.journal is not None:
+            print(f"recovery journal: {error.journal}", file=sys.stderr)
+        return 6
     except MigrationConflict as error:
         print(f"error: {error}", file=sys.stderr)
         return 5
@@ -537,6 +571,116 @@ def _dispatch(args: argparse.Namespace) -> int:
             print(f"{prefix} experiment {args.old_name} -> {args.new_name}")
         return 0
 
+    if (args.noun, args.verb) == ("experiment", "delete"):
+        service = ExperimentDeletionService(authoring.repository)
+        recovered: tuple[dict[str, Any], ...] = ()
+        if not args.dry_run:
+            recovered = service.recover()
+            for item in recovered:
+                print(
+                    f"deletion recovery {item['action']} "
+                    f"transaction={item['transaction']}",
+                    file=sys.stderr,
+                )
+        try:
+            plan = service.plan(args.experiment)
+        except NotFoundError:
+            matching = [
+                item
+                for item in recovered
+                if item.get("experiment") == args.experiment
+                and item.get("action") == "completed"
+            ]
+            if not matching:
+                raise
+            payload = {
+                "experiment": args.experiment,
+                "recovered": True,
+                "transaction": matching[-1]["transaction"],
+            }
+            if args.output == "json":
+                _json({"deletion": payload, "dry_run": False})
+            else:
+                print(
+                    f"recovered deleted experiment {args.experiment} "
+                    f"transaction={matching[-1]['transaction']}"
+                )
+            return 0
+        document = _public_payload(plan.as_dict())
+        if args.dry_run:
+            if args.output == "json":
+                _json({"deletion": document, "dry_run": True})
+            else:
+                _experiment_deletion_report(document)
+            return 0 if plan.ready else 5
+        if not plan.ready:
+            if args.output == "json":
+                print(
+                    json.dumps(
+                        {"deletion": document, "dry_run": False},
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ),
+                    file=sys.stderr,
+                )
+            else:
+                _experiment_deletion_report(document, file=sys.stderr)
+                print("Nothing was changed.", file=sys.stderr)
+            return 5
+        _experiment_deletion_report(document, file=sys.stderr)
+        if not _confirm(
+            f"Delete Experiment {args.experiment} and all listed contents?"
+        ):
+            if args.output == "json":
+                _json(
+                    {
+                        "deletion": {
+                            "experiment": args.experiment,
+                            "cancelled": True,
+                        },
+                        "dry_run": False,
+                    }
+                )
+            else:
+                print("Experiment deletion cancelled. Nothing was changed.")
+            return 0
+        try:
+            result = service.execute(plan)
+        except DeletionConflict as error:
+            print(f"error: {error}", file=sys.stderr)
+            if isinstance(error.plan, ExperimentDeletionPlan):
+                changed = _public_payload(error.plan.as_dict())
+                if args.output == "json":
+                    print(
+                        json.dumps(
+                            {"deletion": changed, "dry_run": False},
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        ),
+                        file=sys.stderr,
+                    )
+                else:
+                    _experiment_deletion_report(changed, file=sys.stderr)
+            print("Nothing was changed.", file=sys.stderr)
+            return 5
+        result_document = _public_payload(result.as_dict())
+        if args.output == "json":
+            _json(
+                {
+                    "deletion": {
+                        "experiment": args.experiment,
+                        **result_document,
+                    },
+                    "dry_run": False,
+                }
+            )
+        else:
+            print(
+                f"deleted experiment {args.experiment} "
+                f"transaction={result_document['transaction']}"
+            )
+        return 0
+
     if (args.noun, args.verb) == ("experiment", "list"):
         experiments = authoring.list_experiments()
         if args.output == "json":
@@ -561,6 +705,145 @@ def _dispatch(args: argparse.Namespace) -> int:
             )
         return 0
 
+    if (args.noun, args.verb) == ("variant", "delete"):
+        service = VariantDeletionService(authoring.repository)
+        recovered: tuple[dict[str, Any], ...] = ()
+        if not args.dry_run:
+            recovered = service.recover()
+            for item in recovered:
+                print(
+                    f"deletion recovery {item['action']} "
+                    f"transaction={item['transaction']}",
+                    file=sys.stderr,
+                )
+        try:
+            plan = service.plan(args.experiment, args.variant)
+        except NotFoundError:
+            matching = [
+                item
+                for item in recovered
+                if item.get("experiment") == args.experiment
+                and item.get("variant") == args.variant
+                and item.get("action") == "completed"
+            ]
+            if not matching:
+                raise
+            payload = {
+                "experiment": args.experiment,
+                "variant": args.variant,
+                "recovered": True,
+                "transaction": matching[-1]["transaction"],
+            }
+            if args.output == "json":
+                _json({"deletion": payload, "dry_run": False})
+            else:
+                print(
+                    f"recovered deleted variant {args.experiment}/{args.variant} "
+                    f"transaction={matching[-1]['transaction']}"
+                )
+            return 0
+        document = _public_payload(plan.as_dict())
+        if args.dry_run:
+            if args.output == "json":
+                _json({"deletion": document, "dry_run": True})
+            else:
+                _variant_deletion_report(document)
+            return 0 if plan.ready and not plan.requires_lineage_confirmation else 5
+        if not plan.ready:
+            if args.output == "json":
+                print(
+                    json.dumps(
+                        {"deletion": document, "dry_run": False},
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ),
+                    file=sys.stderr,
+                )
+            else:
+                _variant_deletion_report(document, file=sys.stderr)
+                print("Nothing was changed.", file=sys.stderr)
+            return 5
+        _variant_deletion_report(document, file=sys.stderr)
+        lineage_confirmed = False
+        if plan.requires_lineage_confirmation:
+            if not _confirm(
+                "Continue with automatic active-lineage reconnection while "
+                "preserving immutable derivation history?"
+            ):
+                print(
+                    "error: Variant deletion is blocked by active child Variants; "
+                    "delete or reorganize them first. Nothing was changed.",
+                    file=sys.stderr,
+                )
+                return 5
+            lineage_confirmed = True
+        if not _confirm(
+            f"Delete Variant {args.experiment}/{args.variant} and all listed "
+            "owned contents?"
+        ):
+            if args.output == "json":
+                _json(
+                    {
+                        "deletion": {
+                            "experiment": args.experiment,
+                            "variant": args.variant,
+                            "cancelled": True,
+                        },
+                        "dry_run": False,
+                    }
+                )
+            else:
+                print("Variant deletion cancelled. Nothing was changed.")
+            return 0
+        try:
+            result = service.execute(
+                plan,
+                allow_lineage_reconnection=lineage_confirmed,
+            )
+        except DeletionConflict as error:
+            print(f"error: {error}", file=sys.stderr)
+            if isinstance(error.plan, VariantDeletionPlan):
+                changed = _public_payload(error.plan.as_dict())
+                if args.output == "json":
+                    print(
+                        json.dumps(
+                            {"deletion": changed, "dry_run": False},
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        ),
+                        file=sys.stderr,
+                    )
+                else:
+                    _variant_deletion_report(changed, file=sys.stderr)
+            print("Nothing was changed.", file=sys.stderr)
+            return 5
+        result_document = _public_payload(result.as_dict())
+        reconnections = [item.as_dict() for item in plan.direct_children]
+        if args.output == "json":
+            _json(
+                {
+                    "deletion": {
+                        "experiment": args.experiment,
+                        "variant": args.variant,
+                        "lineage_reconnections": reconnections,
+                        **result_document,
+                    },
+                    "dry_run": False,
+                }
+            )
+        else:
+            print(
+                f"deleted variant {args.experiment}/{args.variant} "
+                f"transaction={result_document['transaction']}"
+            )
+            for item in plan.direct_children:
+                after = item.effective_parent_after or "<active root>"
+                print(
+                    f"reconnected active lineage {item.address}: "
+                    f"{item.current_parent} -> {after}"
+                )
+        return 0
+
     if (args.noun, args.verb) == ("variant", "create"):
         record = authoring.create_variant(
             args.experiment,
@@ -578,6 +861,143 @@ def _dispatch(args: argparse.Namespace) -> int:
             source_experiment=args.source_experiment,
         )
         print(f"created variant {record.experiment}/{record.document['name']}")
+        return 0
+
+    if (args.noun, args.verb) == ("variant", "promote"):
+        service = VariantPromotionService(authoring.repository)
+        recovered: tuple[dict[str, Any], ...] = ()
+        if not args.dry_run:
+            recovered = service.recover(
+                args.experiment,
+                args.source,
+                args.target,
+            )
+            for item in recovered:
+                print(
+                    f"Variant promotion recovery {item['action']} "
+                    f"transaction={item['transaction']}",
+                    file=sys.stderr,
+                )
+            completed = [
+                item
+                for item in recovered
+                if item["action"] == "completed"
+                and item["experiment"] == args.experiment
+                and item["source"] == args.source
+                and item["target"] == args.target
+            ]
+            if completed:
+                payload = {
+                    "experiment": args.experiment,
+                    "source": args.source,
+                    "target": args.target,
+                    "changed": True,
+                    "recovered": True,
+                    "transaction": completed[-1]["transaction"],
+                    "target_options": "preserved",
+                    "source_variant": "preserved",
+                }
+                if args.output == "json":
+                    _json({"promotion": payload, "dry_run": False})
+                else:
+                    print(
+                        f"recovered promoted variant Code "
+                        f"{args.experiment}/{args.source} -> "
+                        f"{args.experiment}/{args.target} "
+                        f"transaction={completed[-1]['transaction']}"
+                    )
+                return 0
+        plan = service.plan(args.experiment, args.source, args.target)
+        document = _public_payload(plan.as_dict())
+        if args.dry_run:
+            if args.output == "json":
+                _json({"promotion": document, "dry_run": True})
+            else:
+                _variant_promotion_report(document)
+            return 0 if plan.ready else 5
+        if not plan.ready:
+            if args.output == "json":
+                print(
+                    json.dumps(
+                        {"promotion": document, "dry_run": False},
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ),
+                    file=sys.stderr,
+                )
+            else:
+                _variant_promotion_report(document, file=sys.stderr)
+                print("Nothing was changed.", file=sys.stderr)
+            return 5
+        if plan.already_integrated:
+            payload = {
+                "experiment": args.experiment,
+                "source": args.source,
+                "target": args.target,
+                "changed": False,
+                "target_options": "preserved",
+                "source_variant": "preserved",
+            }
+            if args.output == "json":
+                _json({"promotion": payload, "dry_run": False})
+            else:
+                print(
+                    f"unchanged variant promotion {args.experiment}/{args.source} "
+                    f"-> {args.experiment}/{args.target}"
+                )
+            return 0
+        _variant_promotion_report(document, file=sys.stderr)
+        if not _confirm(
+            f"Promote committed Code from {args.experiment}/{args.source} into "
+            f"{args.experiment}/{args.target}? Target Options remain unchanged "
+            "and the source Variant will be preserved."
+        ):
+            if args.output == "json":
+                _json(
+                    {
+                        "promotion": {
+                            "experiment": args.experiment,
+                            "source": args.source,
+                            "target": args.target,
+                            "changed": False,
+                            "cancelled": True,
+                        },
+                        "dry_run": False,
+                    }
+                )
+            else:
+                print("Variant promotion cancelled. Nothing was changed.")
+            return 0
+        try:
+            result = service.execute(plan)
+        except PromotionConflict as error:
+            print(f"error: {error}", file=sys.stderr)
+            if isinstance(error.plan, VariantPromotionPlan):
+                changed = _public_payload(error.plan.as_dict())
+                if args.output == "json":
+                    print(
+                        json.dumps(
+                            {"promotion": changed, "dry_run": False},
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        ),
+                        file=sys.stderr,
+                    )
+                else:
+                    _variant_promotion_report(changed, file=sys.stderr)
+            print("Nothing was changed.", file=sys.stderr)
+            return 5
+        internal_result = result.as_dict()
+        internal_result.pop("journal", None)
+        result_document = _public_payload(internal_result)
+        if args.output == "json":
+            _json({"promotion": result_document, "dry_run": False})
+        else:
+            print(
+                f"promoted variant Code {args.experiment}/{args.source} -> "
+                f"{args.experiment}/{args.target} "
+                f"transaction={result_document['transaction']}"
+            )
         return 0
 
     if (args.noun, args.verb) == ("variant", "list"):
@@ -1047,11 +1467,37 @@ def _parser() -> argparse.ArgumentParser:
         "--dry-run", action="store_true", help="Preview without changing authority"
     )
     _output_argument(experiment_rename)
+    experiment_delete = experiment_verbs.add_parser(
+        "delete",
+        help="Delete an Experiment and its complete active closure",
+        description=(
+            "Plan or confirm recoverable deletion of one Experiment and every "
+            "owned Variant, Run, Model, result, and local projection."
+        ),
+        epilog=_examples(
+            "hkdl experiment delete smoke --dry-run",
+            "hkdl experiment delete smoke",
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    _experiment_argument(
+        experiment_delete,
+        help_text="Experiment whose complete owned closure will be deleted",
+    )
+    experiment_delete.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show the exact deletion plan without prompting or changing state",
+    )
+    _output_argument(experiment_delete)
 
     variant = nouns.add_parser(
         "variant",
-        help="Create, clone, and validate Variants",
-        description="Create, clone, inspect, and validate authored Variants.",
+        help="Create, inspect, promote, rename, and delete Variants",
+        description=(
+            "Create, clone, inspect, validate, promote, rename, and recoverably "
+            "delete authored Variants."
+        ),
     )
     variant_verbs = variant.add_subparsers(
         title="commands",
@@ -1101,6 +1547,40 @@ def _parser() -> argparse.ArgumentParser:
         help="Source Experiment; defaults to the target Experiment",
     )
     source_experiment.completer = complete_experiments
+    variant_promote = variant_verbs.add_parser(
+        "promote",
+        help="Promote committed Source Code into an unchanged Target Variant",
+        description=(
+            "Plan or confirm one-sided promotion of committed schema-2 Variant "
+            "Code while preserving Target Options and the Source Variant."
+        ),
+        epilog=_examples(
+            "hkdl variant promote smoke tuned --to baseline --dry-run",
+            "hkdl variant promote smoke tuned --to baseline",
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    _experiment_argument(variant_promote)
+    promote_source = variant_promote.add_argument(
+        "source",
+        metavar="SOURCE",
+        help="Source Variant whose committed Code is promoted",
+    )
+    promote_source.completer = complete_variants
+    promote_target = variant_promote.add_argument(
+        "--to",
+        dest="target",
+        required=True,
+        metavar="TARGET",
+        help="Unchanged Target Variant that keeps its identity and Options",
+    )
+    promote_target.completer = complete_variants
+    variant_promote.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show the exact promotion plan without prompting or changing state",
+    )
+    _output_argument(variant_promote)
     variant_list = variant_verbs.add_parser(
         "list",
         help="List Variants",
@@ -1150,6 +1630,30 @@ def _parser() -> argparse.ArgumentParser:
         help="Show the binding change without writing it",
     )
     _output_argument(variant_rename)
+    variant_delete = variant_verbs.add_parser(
+        "delete",
+        help="Delete one Variant and its complete active closure",
+        description=(
+            "Plan or confirm recoverable deletion of one Variant and every owned "
+            "Run, Model, result, and local projection."
+        ),
+        epilog=_examples(
+            "hkdl variant delete smoke baseline --dry-run",
+            "hkdl variant delete smoke baseline",
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    _experiment_argument(variant_delete)
+    _variant_argument(
+        variant_delete,
+        help_text="Variant whose complete owned closure will be deleted",
+    )
+    variant_delete.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show the exact deletion and lineage plan without prompting",
+    )
+    _output_argument(variant_delete)
 
     model = nouns.add_parser(
         "model",
@@ -1811,6 +2315,105 @@ def _prune_table(
     )
 
 
+def _experiment_deletion_report(document: dict[str, Any], *, file: Any = None) -> None:
+    if file is None:
+        file = sys.stdout
+    print(f"Experiment deletion plan: {document['experiment']}", file=file)
+    print(f"  Variants: {len(document['variants'])}", file=file)
+    print(f"  Runs: {len(document['runs'])}", file=file)
+    print(f"  Models: {len(document['models'])}", file=file)
+    print(f"  Authored tree: {document['authored_path']}", file=file)
+    for path in document["output_paths"]:
+        print(f"  Output tree: {path}", file=file)
+    print(f"  Ready: {str(document['ready']).lower()}", file=file)
+    if document["variants"]:
+        print("VARIANTS", file=file)
+        for variant in document["variants"]:
+            print(f"- {variant}", file=file)
+    blockers = document["blockers"]
+    if blockers:
+        print("BLOCKERS", file=file)
+    for blocker in blockers:
+        print(f"- {blocker['address']}", file=file)
+        print(f"  code: {blocker['code']}", file=file)
+        if blocker["status"] is not None:
+            print(f"  status: {blocker['status']}", file=file)
+        if blocker["lease"] is not None:
+            print(f"  lease: {blocker['lease']}", file=file)
+        print(f"  reason: {blocker['reason']}", file=file)
+        print(f"  next: {blocker['next_action']}", file=file)
+
+
+def _variant_deletion_report(document: dict[str, Any], *, file: Any = None) -> None:
+    if file is None:
+        file = sys.stdout
+    address = f"{document['experiment']}/{document['variant']}"
+    print(f"Variant deletion plan: {address}", file=file)
+    print(f"  Runs: {len(document['runs'])}", file=file)
+    print(f"  Models: {len(document['models'])}", file=file)
+    print(f"  Authored tree: {document['authored_path']}", file=file)
+    for path in document["output_paths"]:
+        print(f"  Output tree: {path}", file=file)
+    print(f"  Ready: {str(document['ready']).lower()}", file=file)
+    blockers = document["blockers"]
+    if blockers:
+        print("BLOCKERS", file=file)
+    for blocker in blockers:
+        print(f"- {blocker['address']}", file=file)
+        print(f"  code: {blocker['code']}", file=file)
+        if blocker["status"] is not None:
+            print(f"  status: {blocker['status']}", file=file)
+        if blocker["lease"] is not None:
+            print(f"  lease: {blocker['lease']}", file=file)
+        print(f"  reason: {blocker['reason']}", file=file)
+        print(f"  next: {blocker['next_action']}", file=file)
+    derived = document["derived_variants"]
+    if not derived:
+        return
+    print("CHILD VARIANT WARNING", file=file)
+    print(
+        "Deleting this Variant directly changes the active lineage. HKDL can "
+        "continue the lineage while preserving immutable derivation history, "
+        "but deleting or reorganizing child Variants first is preferred.",
+        file=file,
+    )
+    for child in derived:
+        after = child["effective_parent_after"] or "<active root>"
+        print(f"- {child['address']} relation={child['relation']}", file=file)
+        if child["reconnected"]:
+            print(
+                f"  active lineage: {child['current_parent']} -> {after}",
+                file=file,
+            )
+        else:
+            print(f"  active parent remains: {after}", file=file)
+
+
+def _variant_promotion_report(document: dict[str, Any], *, file: Any = None) -> None:
+    if file is None:
+        file = sys.stdout
+    source = f"{document['experiment']}/{document['source']}"
+    target = f"{document['experiment']}/{document['target']}"
+    print(f"Variant Code promotion plan: {source} -> {target}", file=file)
+    print(f"  Ready: {str(document['ready']).lower()}", file=file)
+    print(f"  Changed: {str(document['changed']).lower()}", file=file)
+    print(f"  Target Options: {document['target_options']}", file=file)
+    print(f"  Source Variant: {document['source_variant']}", file=file)
+    if document["template_changed"]:
+        print("  Code change: Template provenance", file=file)
+    if document["components_changed"]:
+        print("  Code change: components", file=file)
+    for path in document["changed_paths"]:
+        print(f"  Source path: {path}", file=file)
+    blockers = document["blockers"]
+    if blockers:
+        print("BLOCKERS", file=file)
+    for blocker in blockers:
+        print(f"- {blocker['code']}", file=file)
+        print(f"  reason: {blocker['reason']}", file=file)
+        print(f"  next: {blocker['next_action']}", file=file)
+
+
 def _confirm(question: str) -> bool:
     print(f"{question} [y/N] ", end="", file=sys.stderr, flush=True)
     return sys.stdin.readline().strip().lower() in {"y", "yes"}
@@ -1927,11 +2530,23 @@ def _public_payload(value: Any) -> Any:
             not in {
                 "before_head",
                 "binding_transaction",
+                "checkpoint_blob",
+                "dependencies",
+                "event_chain",
                 "attempt_hashes",
                 "run_spec_hashes",
                 "event_hashes",
                 "result_hashes",
                 "blob_hashes",
+                "operations",
+                "plan_digest",
+                "producing_attempt",
+                "retry_parent",
+                "unbound",
+                "variant_hashes",
+                "revision_hashes",
+                "source_draft_fingerprint",
+                "target_draft_fingerprint",
             }
         }
     if isinstance(value, list):

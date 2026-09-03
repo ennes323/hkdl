@@ -523,6 +523,14 @@ def _extract_record_references(
             references,
         )
         _add_reference(
+            record,
+            payload,
+            "merge_parent",
+            "variant_revision",
+            by_digest,
+            references,
+        )
+        _add_reference(
             record, payload, "source_tree", "source_tree", by_digest, references
         )
         _add_mapping_references(

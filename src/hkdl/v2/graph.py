@@ -183,6 +183,7 @@ class V2Graph:
         variant: VariantRecord,
         *,
         derivation_parent: str | None = None,
+        merge_parent: str | None = None,
         creation_nonce: str | None = None,
         commit_experiment: bool = True,
     ) -> VariantIdentity:
@@ -224,6 +225,7 @@ class V2Graph:
             source_tree.digest,
             parent=current_revision,
             derivation_parent=derivation_parent,
+            merge_parent=merge_parent,
         )
         if current_revision is not None and _same_revision_content(
             self.store.load(current_revision).payload,
@@ -286,6 +288,7 @@ class V2Graph:
         *,
         parent: str | None,
         derivation_parent: str | None = None,
+        merge_parent: str | None = None,
     ) -> VariantIdentity:
         source_tree = self.capture_source_tree(variant.path / "src", publish=False)
         revision_payload = self.variant_revision_payload(
@@ -294,6 +297,7 @@ class V2Graph:
             source_tree.digest,
             parent=parent,
             derivation_parent=derivation_parent,
+            merge_parent=merge_parent,
         )
         changed = True
         revision_hash = object_digest(
@@ -438,8 +442,9 @@ class V2Graph:
         *,
         parent: str | None,
         derivation_parent: str | None,
+        merge_parent: str | None = None,
     ) -> dict[str, Any]:
-        return {
+        payload = {
             "variant": variant_hash,
             "parent": parent,
             "derivation_parent": derivation_parent,
@@ -447,6 +452,9 @@ class V2Graph:
             "source_tree": source_tree_hash,
             "components": deepcopy(document["components"]),
         }
+        if merge_parent is not None:
+            payload["merge_parent"] = merge_parent
+        return payload
 
     def _evaluation_cases(
         self, document: dict[str, Any], *, publish: bool
@@ -540,7 +548,7 @@ def _timestamp(now: datetime) -> str:
 
 
 def _same_revision_content(first: dict[str, Any], second: dict[str, Any]) -> bool:
-    ignored = {"parent", "derivation_parent"}
+    ignored = {"parent", "derivation_parent", "merge_parent"}
     return {key: value for key, value in first.items() if key not in ignored} == {
         key: value for key, value in second.items() if key not in ignored
     }

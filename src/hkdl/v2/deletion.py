@@ -1,10 +1,9 @@
-"""Planning and recoverable execution for logical v2 Run deletion.
+"""Planning and recoverable execution for logical v2 deletion.
 
-The v2 object store is immutable.  Deleting a Run therefore means removing
-the current name bindings that make its execution lineage reachable and
-moving the legacy Run/Model projection to a recoverable trash transaction.
-Objects, blobs, and the append-only binding history are deliberately left in
-place.
+The v2 object store is immutable.  Deleting a Run or Experiment therefore
+means removing the current name bindings that make it reachable and moving
+its authored/generated projections to a recoverable trash transaction.
+Objects, blobs, and the append-only binding history are deliberately retained.
 """
 
 from __future__ import annotations
@@ -30,11 +29,17 @@ from ..storage import (
     atomic_replace,
     atomic_write_new,
 )
-from .bindings import BindingOperation
+from .bindings import BindingHeadConflict, BindingOperation
 from .graph import (
     CURRENT_REVISION_NAME,
     V2Graph,
     attempt_event_scope,
+    entity_revision_scope,
+    evaluation_case_scope,
+    experiment_variant_scope,
+    export_profile_scope,
+    comparison_group_scope,
+    variant_model_scope,
     variant_run_scope,
     workspace_experiment_scope,
 )
@@ -54,14 +59,27 @@ _JOURNAL_PHASES = frozenset(
 
 
 class DeletionConflict(RuntimeError):
-    """A Run deletion is unsafe or requires an explicit deletion option."""
+    """A deletion is unsafe or requires an explicit deletion option."""
 
-    def __init__(self, message: str, plan: "RunDeletionPlan | None" = None):
+    def __init__(
+        self,
+        message: str,
+        plan: "RunDeletionPlan | ExperimentDeletionPlan | VariantDeletionPlan | None" = None,
+    ):
         super().__init__(message)
         self.plan = plan
 
 
 RunDeletionConflict = DeletionConflict
+
+
+class DeletionFailure(RuntimeError):
+    """A confirmed deletion hit an operational failure."""
+
+    def __init__(self, message: str, *, state: str, journal: Path | None = None):
+        super().__init__(message)
+        self.state = state
+        self.journal = journal
 
 
 @dataclass(frozen=True)
@@ -268,6 +286,172 @@ DeletionResult = RunDeletionResult
 
 
 @dataclass(frozen=True)
+class ExperimentDeletionBlocker:
+    """One actionable reason an Experiment cannot be deleted."""
+
+    code: str
+    address: str
+    status: str | None
+    lease: str | None
+    reason: str
+    next_action: str
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "code": self.code,
+            "address": self.address,
+            "status": self.status,
+            "lease": self.lease,
+            "reason": self.reason,
+            "next_action": self.next_action,
+        }
+
+
+@dataclass(frozen=True)
+class ExperimentDeletionPlan:
+    """Deterministic read-only plan for deleting one complete Experiment."""
+
+    experiment: str
+    experiment_hash: str
+    before_head: str | None
+    variants: tuple[str, ...]
+    variant_hashes: tuple[str, ...]
+    runs: tuple[DeletionRun, ...]
+    models: tuple[DeletionModel, ...]
+    operations: tuple[BindingOperation, ...]
+    blockers: tuple[ExperimentDeletionBlocker, ...]
+    authored_path: str
+    output_paths: tuple[str, ...]
+    plan_digest: str
+
+    @property
+    def ready(self) -> bool:
+        return not self.blockers
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "experiment": self.experiment,
+            "experiment_hash": self.experiment_hash,
+            "before_head": self.before_head,
+            "variants": list(self.variants),
+            "variant_hashes": list(self.variant_hashes),
+            "runs": [item.as_dict() for item in self.runs],
+            "models": [item.as_dict() for item in self.models],
+            "operations": [item.as_dict() for item in self.operations],
+            "blockers": [item.as_dict() for item in self.blockers],
+            "authored_path": self.authored_path,
+            "output_paths": list(self.output_paths),
+            "ready": self.ready,
+            "plan_digest": self.plan_digest,
+        }
+
+    def digest_payload(self) -> dict[str, Any]:
+        document = self.as_dict()
+        document.pop("plan_digest", None)
+        for run in document["runs"]:
+            run.pop("path", None)
+        for model in document["models"]:
+            model.pop("path", None)
+        return document
+
+
+ExperimentDeletionResult = RunDeletionResult
+
+
+@dataclass(frozen=True)
+class DerivedVariant:
+    """One active Variant below the selected Variant in effective lineage."""
+
+    experiment: str
+    variant: str
+    address: str
+    relation: str
+    depth: int
+    current_parent: str
+    effective_parent_after: str | None
+
+    @property
+    def reconnected(self) -> bool:
+        return self.depth == 1
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "experiment": self.experiment,
+            "variant": self.variant,
+            "address": self.address,
+            "relation": self.relation,
+            "depth": self.depth,
+            "current_parent": self.current_parent,
+            "effective_parent_after": self.effective_parent_after,
+            "reconnected": self.reconnected,
+        }
+
+
+@dataclass(frozen=True)
+class VariantDeletionPlan:
+    """Deterministic plan for deleting one complete active Variant owner."""
+
+    experiment: str
+    variant: str
+    experiment_hash: str
+    variant_hash: str
+    before_head: str | None
+    revision_hashes: tuple[str, ...]
+    runs: tuple[DeletionRun, ...]
+    models: tuple[DeletionModel, ...]
+    operations: tuple[BindingOperation, ...]
+    blockers: tuple[ExperimentDeletionBlocker, ...]
+    derived_variants: tuple[DerivedVariant, ...]
+    authored_path: str
+    output_paths: tuple[str, ...]
+    plan_digest: str
+
+    @property
+    def ready(self) -> bool:
+        return not self.blockers
+
+    @property
+    def requires_lineage_confirmation(self) -> bool:
+        return bool(self.derived_variants)
+
+    @property
+    def direct_children(self) -> tuple[DerivedVariant, ...]:
+        return tuple(item for item in self.derived_variants if item.reconnected)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "experiment": self.experiment,
+            "variant": self.variant,
+            "experiment_hash": self.experiment_hash,
+            "variant_hash": self.variant_hash,
+            "before_head": self.before_head,
+            "revision_hashes": list(self.revision_hashes),
+            "runs": [item.as_dict() for item in self.runs],
+            "models": [item.as_dict() for item in self.models],
+            "operations": [item.as_dict() for item in self.operations],
+            "blockers": [item.as_dict() for item in self.blockers],
+            "derived_variants": [item.as_dict() for item in self.derived_variants],
+            "authored_path": self.authored_path,
+            "output_paths": list(self.output_paths),
+            "ready": self.ready,
+            "requires_lineage_confirmation": self.requires_lineage_confirmation,
+            "plan_digest": self.plan_digest,
+        }
+
+    def digest_payload(self) -> dict[str, Any]:
+        document = self.as_dict()
+        document.pop("plan_digest", None)
+        for run in document["runs"]:
+            run.pop("path", None)
+        for model in document["models"]:
+            model.pop("path", None)
+        return document
+
+
+VariantDeletionResult = RunDeletionResult
+
+
+@dataclass(frozen=True)
 class _VariantContext:
     experiment: str
     variant: str
@@ -307,6 +491,7 @@ class RunDeletionService:
 
         if not self.graph.is_active():
             raise ContractError("HKDL v2 is not active")
+        self._assert_no_pending_deletion()
         bindings = self.graph.bindings.bindings()
         contexts = self._contexts(bindings)
         experiment_hash = self.graph.experiment_hash(experiment)
@@ -578,13 +763,16 @@ class RunDeletionService:
                 self._finish_moved(document, transaction_dir)
                 GraphProjection(self.graph).rebuild()
                 self._write_journal(document, journal, phase="completed")
-                recovered.append(
-                    {
-                        "transaction": transaction_dir.name,
-                        "action": "completed",
-                        "phase": "completed",
-                    }
-                )
+                item = {
+                    "transaction": transaction_dir.name,
+                    "action": "completed",
+                    "phase": "completed",
+                }
+                if (experiment := _journal_experiment(document)) is not None:
+                    item["experiment"] = experiment
+                if (variant := _journal_variant(document)) is not None:
+                    item["experiment"], item["variant"] = variant
+                recovered.append(item)
                 continue
             if current_head != before_head:
                 raise DeletionConflict(
@@ -592,13 +780,16 @@ class RunDeletionService:
                 )
             self._restore_entries(document, transaction_dir)
             self._write_journal(document, journal, phase="rolled_back")
-            recovered.append(
-                {
-                    "transaction": transaction_dir.name,
-                    "action": "rolled_back",
-                    "phase": "rolled_back",
-                }
-            )
+            item = {
+                "transaction": transaction_dir.name,
+                "action": "rolled_back",
+                "phase": "rolled_back",
+            }
+            if (experiment := _journal_experiment(document)) is not None:
+                item["experiment"] = experiment
+            if (variant := _journal_variant(document)) is not None:
+                item["experiment"], item["variant"] = variant
+            recovered.append(item)
         return tuple(recovered)
 
     recover_pending = recover
@@ -632,6 +823,7 @@ class RunDeletionService:
             "entries": entries,
         }
         self._write_journal(document, journal, phase="planned")
+        commit_started = False
         try:
             with self._run_locks(plan.runs):
                 if self.graph.bindings.head() != plan.before_head:
@@ -643,7 +835,16 @@ class RunDeletionService:
                     raise DeletionConflict(
                         "binding HEAD changed after projection move", plan
                     )
-                binding_transaction = self.graph.bindings.commit(list(plan.operations))
+                commit_started = True
+                try:
+                    binding_transaction = self.graph.bindings.commit(
+                        list(plan.operations), expected_head=plan.before_head
+                    )
+                except BindingHeadConflict as error:
+                    commit_started = False
+                    raise DeletionConflict(
+                        "binding HEAD changed before deletion commit", plan
+                    ) from error
                 document["binding_transaction"] = binding_transaction
                 self._write_journal(document, journal, phase="binding_committed")
                 self._verify_unbound(plan)
@@ -652,8 +853,18 @@ class RunDeletionService:
         except BaseException:
             if document.get("binding_transaction") is None:
                 try:
-                    self._restore_entries(document, transaction_dir)
-                    self._write_journal(document, journal, phase="rolled_back")
+                    if not commit_started:
+                        self._restore_entries(document, transaction_dir)
+                        self._write_journal(document, journal, phase="rolled_back")
+                    else:
+                        current_head = self.graph.bindings.head()
+                        if current_head == document.get("before_head"):
+                            self._restore_entries(document, transaction_dir)
+                            self._write_journal(document, journal, phase="rolled_back")
+                        elif current_head is not None and self._head_matches_journal(
+                            current_head, document
+                        ):
+                            document["binding_transaction"] = current_head
                 except BaseException:
                     # Keep the journal in its current phase for later recovery.
                     pass
@@ -958,6 +1169,30 @@ class RunDeletionService:
         except NotFoundError:
             return None
 
+    def _assert_no_pending_deletion(self) -> None:
+        if not os.path.lexists(self.trash_root):
+            return
+        _require_directory(self.trash_root, "deletion trash root")
+        pending: list[str] = []
+        for transaction_dir in sorted(
+            self.trash_root.iterdir(), key=lambda item: item.name
+        ):
+            if transaction_dir.is_symlink() or not transaction_dir.is_dir():
+                raise ContractError("deletion trash contains an invalid transaction")
+            journal = transaction_dir / "journal.json"
+            if not os.path.lexists(journal):
+                continue
+            document = _load_json(journal, "deletion journal")
+            self._validate_journal(document, transaction_dir.name)
+            if document.get("phase") not in {"completed", "rolled_back"}:
+                pending.append(str(journal.relative_to(self.repository.root)))
+        if pending:
+            raise DeletionConflict(
+                "deletion planning is blocked by pending deletion recovery: "
+                + ", ".join(pending)
+                + "; repeat the original non-dry-run deletion command to recover it"
+            )
+
     def _journal_entries(
         self,
         plan: RunDeletionPlan,
@@ -1109,9 +1344,18 @@ class RunDeletionService:
         operations = document.get("operations")
         if not isinstance(operations, list) or not operations:
             raise ContractError("deletion journal operations are invalid")
+        if binding_transaction is not None and not self._head_matches_journal(
+            binding_transaction, document
+        ):
+            raise ContractError(
+                "deletion journal binding transaction does not match operations"
+            )
         entries = document.get("entries")
         if not isinstance(entries, list):
             raise ContractError("deletion journal entries are invalid")
+        sources: set[str] = set()
+        targets: set[str] = set()
+        target_prefix = Path(".hkdl/trash/deletions") / transaction / "projection"
         for entry in entries:
             if not isinstance(entry, dict) or not {"source", "target"}.issubset(entry):
                 raise ContractError("deletion journal entry is invalid")
@@ -1124,6 +1368,24 @@ class RunDeletionService:
                     or ".." in Path(value).parts
                 ):
                     raise ContractError("deletion journal path is invalid")
+            source = Path(entry["source"])
+            target = Path(entry["target"])
+            if len(source.parts) < 2 or source.parts[0] not in {
+                "experiments",
+                "outputs",
+            }:
+                raise ContractError("deletion journal source is outside owned roots")
+            if (
+                len(target.parts) <= len(target_prefix.parts)
+                or target.parts[: len(target_prefix.parts)] != target_prefix.parts
+            ):
+                raise ContractError(
+                    "deletion journal target is outside its transaction"
+                )
+            if str(source) in sources or str(target) in targets:
+                raise ContractError("deletion journal contains duplicate paths")
+            sources.add(str(source))
+            targets.add(str(target))
 
     def _transaction_name(self, plan: RunDeletionPlan) -> str:
         nonce = str(self._nonce())
@@ -1177,8 +1439,794 @@ class RunDeletionService:
             yield
 
 
+class ExperimentDeletionService(RunDeletionService):
+    """Plan and apply deletion of one complete active Experiment closure."""
+
+    owner_label = "Experiment"
+
+    @workspace_operation
+    def plan(self, experiment: str) -> ExperimentDeletionPlan:
+        if not self.graph.is_active():
+            raise ContractError("HKDL v2 is not active")
+        self._assert_no_pending_deletion()
+        self._assert_no_pending_rename()
+
+        bindings = self.graph.bindings.bindings()
+        experiment_hash = self.graph.experiment_hash(experiment)
+        experiment_object = self._typed(experiment_hash, "experiment")
+        if experiment_object.payload.get("created_at") is None:
+            raise ContractError("v2 Experiment object is invalid")
+
+        contexts = self._contexts(bindings)
+        selected_contexts = tuple(
+            sorted(
+                (
+                    context
+                    for context in contexts.values()
+                    if context.experiment == experiment
+                ),
+                key=lambda item: item.variant.encode("utf-8"),
+            )
+        )
+        variant_hashes = tuple(item.variant_hash for item in selected_contexts)
+        variants = tuple(item.variant for item in selected_contexts)
+        selected_variant_hashes = set(variant_hashes)
+
+        runs = tuple(
+            sorted(
+                (
+                    item
+                    for item in self._runs(bindings, contexts)
+                    if item.variant_hash in selected_variant_hashes
+                ),
+                key=lambda item: item.address.encode("utf-8"),
+            )
+        )
+        models = tuple(
+            sorted(
+                (
+                    item
+                    for item in self._models(bindings, contexts)
+                    if item.variant_hash in selected_variant_hashes
+                ),
+                key=lambda item: (
+                    item.variant.encode("utf-8"),
+                    item.model_id.encode("utf-8"),
+                ),
+            )
+        )
+
+        authored = self.repository.experiments / experiment
+        _is_directory(authored)
+        historical_names = self.graph.bindings.historical_names(
+            workspace_experiment_scope(), experiment_hash
+        )
+        output_paths = tuple(
+            _relative_to_root(self.repository.outputs / name, self.repository.root)
+            for name in historical_names
+        )
+        for path in output_paths:
+            _is_directory(self.repository.root / path)
+
+        revision_hashes = self._owned_variant_revisions(selected_variant_hashes)
+        scopes = {
+            workspace_experiment_scope(),
+            entity_revision_scope(experiment_hash),
+            experiment_variant_scope(experiment_hash),
+        }
+        for variant_hash in variant_hashes:
+            scopes.update(
+                {
+                    entity_revision_scope(variant_hash),
+                    variant_run_scope(variant_hash),
+                    variant_model_scope(variant_hash),
+                }
+            )
+        for revision_hash in revision_hashes:
+            scopes.update(
+                {
+                    evaluation_case_scope(revision_hash),
+                    export_profile_scope(revision_hash),
+                    comparison_group_scope(revision_hash),
+                }
+            )
+        for item in runs:
+            scopes.add(attempt_event_scope(item.attempt_hash))
+
+        operations = tuple(
+            BindingOperation("unbind", scope, name, target)
+            for (scope, name), target in sorted(
+                bindings.items(),
+                key=lambda item: (
+                    item[0][0].encode("utf-8"),
+                    item[0][1].encode("utf-8"),
+                    item[1],
+                ),
+            )
+            if scope in scopes
+            and not (
+                scope == workspace_experiment_scope()
+                and (name != experiment or target != experiment_hash)
+            )
+        )
+        if not any(
+            item.scope == workspace_experiment_scope()
+            and item.name == experiment
+            and item.target == experiment_hash
+            for item in operations
+        ):
+            raise ContractError("v2 Experiment binding is missing from deletion plan")
+
+        blockers = self._experiment_blockers(runs)
+        provisional = ExperimentDeletionPlan(
+            experiment=experiment,
+            experiment_hash=experiment_hash,
+            before_head=self.graph.bindings.head(),
+            variants=variants,
+            variant_hashes=variant_hashes,
+            runs=runs,
+            models=models,
+            operations=operations,
+            blockers=blockers,
+            authored_path=_relative_to_root(authored, self.repository.root),
+            output_paths=output_paths,
+            plan_digest="",
+        )
+        digest = object_digest("binding_transaction", provisional.digest_payload())
+        return ExperimentDeletionPlan(
+            experiment=provisional.experiment,
+            experiment_hash=provisional.experiment_hash,
+            before_head=provisional.before_head,
+            variants=provisional.variants,
+            variant_hashes=provisional.variant_hashes,
+            runs=provisional.runs,
+            models=provisional.models,
+            operations=provisional.operations,
+            blockers=provisional.blockers,
+            authored_path=provisional.authored_path,
+            output_paths=provisional.output_paths,
+            plan_digest=digest,
+        )
+
+    @workspace_operation
+    def execute(self, plan: ExperimentDeletionPlan) -> ExperimentDeletionResult:
+        entities = [("experiment", plan.experiment_hash)] + [
+            ("variant", digest) for digest in plan.variant_hashes
+        ]
+        with entity_guard(self.repository, entities):
+            current = self.plan(plan.experiment)
+            if current.plan_digest != plan.plan_digest:
+                raise DeletionConflict(
+                    "Experiment deletion plan changed after confirmation", current
+                )
+            if not current.ready:
+                raise DeletionConflict(
+                    "Experiment deletion is blocked: "
+                    + "; ".join(item.reason for item in current.blockers),
+                    current,
+                )
+            try:
+                return super()._execute(current)
+            except DeletionConflict as error:
+                try:
+                    refreshed = self.plan(plan.experiment)
+                except (ContractError, NotFoundError):
+                    refreshed = current
+                raise DeletionConflict(str(error), refreshed) from error
+            except Exception as error:
+                state, journal = self._failure_state(current)
+                raise DeletionFailure(
+                    f"Experiment deletion failed ({state}): {error}",
+                    state=state,
+                    journal=journal,
+                ) from error
+
+    def _owned_variant_revisions(self, variant_hashes: set[str]) -> tuple[str, ...]:
+        revisions = {
+            item.digest
+            for item in self.graph.store.iter_records()
+            if item.kind == "variant_revision"
+            and item.payload.get("variant") in variant_hashes
+        }
+        for variant_hash in variant_hashes:
+            revisions.add(self.graph.current_revision(variant_hash))
+        return tuple(sorted(revisions))
+
+    def _assert_no_pending_rename(self) -> None:
+        journal_root = self.graph.store.root / "refs/renames"
+        if not os.path.lexists(journal_root):
+            return
+        _require_directory(journal_root, "v2 rename journal root")
+        if any(journal_root.iterdir()):
+            raise DeletionConflict(
+                f"{self.owner_label} deletion is blocked by pending authored rename "
+                "recovery; repeat the original Experiment or Variant rename "
+                "command before deleting"
+            )
+
+    def _experiment_blockers(
+        self,
+        runs: tuple[DeletionRun, ...],
+        *,
+        owner_label: str = "Experiment",
+    ) -> tuple[ExperimentDeletionBlocker, ...]:
+        blockers: list[ExperimentDeletionBlocker] = []
+        held = set(self._held_leases(runs))
+        for item in runs:
+            lease = "held" if item.address in held else "not held"
+            if item.status not in TERMINAL_STATUSES:
+                blockers.append(
+                    ExperimentDeletionBlocker(
+                        "RUN_NONTERMINAL",
+                        item.address,
+                        item.status,
+                        lease,
+                        f"{owner_label} deletion requires every Run to be terminal.",
+                        (
+                            f"inspect with `hkdl status {item.experiment} "
+                            f"{item.variant} {item.run_id} --full`; resolve the Run "
+                            "or explicitly delete the stale Run first"
+                        ),
+                    )
+                )
+            if item.address in held:
+                blockers.append(
+                    ExperimentDeletionBlocker(
+                        "RUN_LEASE_HELD",
+                        item.address,
+                        item.status,
+                        "held",
+                        "A process still holds this Run identity.",
+                        "wait for the process to release the Run, then retry",
+                    )
+                )
+        return tuple(
+            sorted(
+                blockers,
+                key=lambda item: (
+                    item.address.encode("utf-8"),
+                    item.code.encode("utf-8"),
+                ),
+            )
+        )
+
+    def _journal_entries(
+        self,
+        plan: ExperimentDeletionPlan,
+        transaction_dir: Path,
+    ) -> list[dict[str, Any]]:
+        result = []
+        sources = [
+            ("experiment", plan.experiment, plan.authored_path, "authored-experiment")
+        ]
+        sources.extend(
+            (
+                "outputs",
+                Path(output_path).name,
+                output_path,
+                f"generated-outputs/{index:04d}",
+            )
+            for index, output_path in enumerate(plan.output_paths)
+        )
+        for kind, address, source_path, target_name in sources:
+            target = _relative_to_root(
+                transaction_dir / "projection" / target_name,
+                self.repository.root,
+            )
+            result.append(
+                {
+                    "kind": kind,
+                    "address": address,
+                    "source": source_path,
+                    "target": target,
+                    "moved": False,
+                    "missing": False,
+                }
+            )
+        return result
+
+    def _failure_state(self, plan: ExperimentDeletionPlan) -> tuple[str, Path | None]:
+        journals = sorted(
+            self.trash_root.glob(
+                f"delete-{plan.plan_digest.removeprefix('sha256:')[:20]}-*/journal.json"
+            )
+        )
+        journal = journals[-1] if journals else None
+        try:
+            active = (
+                self.graph.bindings.resolve(
+                    workspace_experiment_scope(), plan.experiment
+                )
+                == plan.experiment_hash
+            )
+        except NotFoundError:
+            active = False
+        if not active:
+            return "deletion committed; recovery required", journal
+        if journal is None:
+            return "nothing changed", None
+        try:
+            phase = _load_json(journal, "deletion journal").get("phase")
+        except ContractError:
+            phase = None
+        if phase == "rolled_back":
+            return "rolled back successfully", journal
+        return "nothing committed; recovery required", journal
+
+
+class VariantDeletionService(ExperimentDeletionService):
+    """Plan and apply deletion of one complete active Variant closure."""
+
+    owner_label = "Variant"
+
+    @workspace_operation
+    def plan(self, experiment: str, variant: str) -> VariantDeletionPlan:
+        if not self.graph.is_active():
+            raise ContractError("HKDL v2 is not active")
+        self._assert_no_pending_deletion()
+        self._assert_no_pending_rename()
+
+        bindings = self.graph.bindings.bindings()
+        experiment_hash = self.graph.experiment_hash(experiment)
+        variant_hash = self.graph.variant_hash(experiment_hash, variant)
+        variant_object = self._typed(variant_hash, "variant")
+        if variant_object.payload.get("experiment") != experiment_hash:
+            raise ContractError("v2 Variant ownership mismatch")
+
+        contexts = self._contexts(bindings)
+        context = contexts.get(variant_hash)
+        if (
+            context is None
+            or context.experiment != experiment
+            or context.variant != variant
+        ):
+            raise ContractError("v2 Variant binding is missing from deletion plan")
+
+        runs = tuple(
+            sorted(
+                (
+                    item
+                    for item in self._runs(bindings, contexts)
+                    if item.variant_hash == variant_hash
+                ),
+                key=lambda item: item.address.encode("utf-8"),
+            )
+        )
+        models = tuple(
+            sorted(
+                (
+                    item
+                    for item in self._models(bindings, contexts)
+                    if item.variant_hash == variant_hash
+                ),
+                key=lambda item: item.model_id.encode("utf-8"),
+            )
+        )
+        self._validate_variant_closure(variant_hash, runs, models, bindings)
+
+        revision_hashes = self._owned_variant_revisions({variant_hash})
+        scopes = {
+            entity_revision_scope(variant_hash),
+            variant_run_scope(variant_hash),
+            variant_model_scope(variant_hash),
+        }
+        for revision_hash in revision_hashes:
+            scopes.update(
+                {
+                    evaluation_case_scope(revision_hash),
+                    export_profile_scope(revision_hash),
+                    comparison_group_scope(revision_hash),
+                }
+            )
+        for item in runs:
+            scopes.add(attempt_event_scope(item.attempt_hash))
+
+        variant_scope = experiment_variant_scope(experiment_hash)
+        operations = tuple(
+            BindingOperation("unbind", scope, name, target)
+            for (scope, name), target in sorted(
+                bindings.items(),
+                key=lambda item: (
+                    item[0][0].encode("utf-8"),
+                    item[0][1].encode("utf-8"),
+                    item[1],
+                ),
+            )
+            if (
+                scope in scopes
+                or (
+                    scope == variant_scope
+                    and name == variant
+                    and target == variant_hash
+                )
+            )
+        )
+        if not any(
+            item.scope == variant_scope
+            and item.name == variant
+            and item.target == variant_hash
+            for item in operations
+        ):
+            raise ContractError("v2 Variant binding is missing from deletion plan")
+
+        authored = self.repository.experiments / experiment / variant
+        _is_directory(authored)
+        experiment_names = self.graph.bindings.historical_names(
+            workspace_experiment_scope(), experiment_hash
+        )
+        variant_names = self.graph.bindings.historical_names(
+            variant_scope, variant_hash
+        )
+        output_paths = tuple(
+            _relative_to_root(
+                self.repository.outputs / experiment_name / variant_name,
+                self.repository.root,
+            )
+            for experiment_name in experiment_names
+            for variant_name in variant_names
+        )
+        for path in output_paths:
+            _is_directory(self.repository.root / path)
+
+        blockers = self._experiment_blockers(runs, owner_label="Variant")
+        derived_variants = self._derived_variants(variant_hash, contexts)
+        provisional = VariantDeletionPlan(
+            experiment=experiment,
+            variant=variant,
+            experiment_hash=experiment_hash,
+            variant_hash=variant_hash,
+            before_head=self.graph.bindings.head(),
+            revision_hashes=revision_hashes,
+            runs=runs,
+            models=models,
+            operations=operations,
+            blockers=blockers,
+            derived_variants=derived_variants,
+            authored_path=_relative_to_root(authored, self.repository.root),
+            output_paths=output_paths,
+            plan_digest="",
+        )
+        digest = object_digest("binding_transaction", provisional.digest_payload())
+        return VariantDeletionPlan(
+            experiment=provisional.experiment,
+            variant=provisional.variant,
+            experiment_hash=provisional.experiment_hash,
+            variant_hash=provisional.variant_hash,
+            before_head=provisional.before_head,
+            revision_hashes=provisional.revision_hashes,
+            runs=provisional.runs,
+            models=provisional.models,
+            operations=provisional.operations,
+            blockers=provisional.blockers,
+            derived_variants=provisional.derived_variants,
+            authored_path=provisional.authored_path,
+            output_paths=provisional.output_paths,
+            plan_digest=digest,
+        )
+
+    @workspace_operation
+    def execute(
+        self,
+        plan: VariantDeletionPlan,
+        *,
+        allow_lineage_reconnection: bool = False,
+    ) -> VariantDeletionResult:
+        with entity_guard(
+            self.repository,
+            [
+                ("experiment", plan.experiment_hash),
+                ("variant", plan.variant_hash),
+            ],
+        ):
+            current = self.plan(plan.experiment, plan.variant)
+            if current.plan_digest != plan.plan_digest:
+                raise DeletionConflict(
+                    "Variant deletion plan changed after confirmation", current
+                )
+            if not current.ready:
+                raise DeletionConflict(
+                    "Variant deletion is blocked: "
+                    + "; ".join(item.reason for item in current.blockers),
+                    current,
+                )
+            if current.requires_lineage_confirmation and not allow_lineage_reconnection:
+                raise DeletionConflict(
+                    "Variant deletion is blocked by active child Variants; "
+                    "explicit lineage reconnection confirmation is required",
+                    current,
+                )
+            try:
+                return RunDeletionService._execute(self, current)
+            except DeletionConflict as error:
+                try:
+                    refreshed = self.plan(plan.experiment, plan.variant)
+                except (ContractError, NotFoundError):
+                    refreshed = current
+                raise DeletionConflict(str(error), refreshed) from error
+            except Exception as error:
+                state, journal = self._failure_state(current)
+                raise DeletionFailure(
+                    f"Variant deletion failed ({state}): {error}",
+                    state=state,
+                    journal=journal,
+                ) from error
+
+    def _validate_variant_closure(
+        self,
+        variant_hash: str,
+        runs: tuple[DeletionRun, ...],
+        models: tuple[DeletionModel, ...],
+        bindings: dict[tuple[str, str], str],
+    ) -> None:
+        attempts = {item.attempt_hash for item in runs}
+        model_hashes = {item.model_hash for item in models}
+        for item in runs:
+            spec = self._typed(item.run_spec_hash, "run_spec")
+            revision_field = {
+                "train": "variant_revision",
+                "eval": "evaluator_revision",
+                "export": "exporter_revision",
+            }[item.action]
+            revision_hash = _required_digest(
+                spec.payload.get(revision_field), "RunSpec Variant revision"
+            )
+            revision = self._typed(revision_hash, "variant_revision")
+            if revision.payload.get("variant") != variant_hash:
+                raise ContractError("v2 Run Code ownership mismatch")
+            if item.retry_parent is not None and item.retry_parent not in attempts:
+                raise ContractError("v2 Run retry ownership mismatch")
+            if item.action in {"eval", "export"}:
+                model_hash = _required_digest(
+                    spec.payload.get("model"), "RunSpec model"
+                )
+                if model_hash not in model_hashes:
+                    raise ContractError("v2 Run Model ownership mismatch")
+        for item in models:
+            if item.producing_attempt not in attempts:
+                raise ContractError("v2 Model producer ownership mismatch")
+            model = self._typed(item.model_hash, "model")
+            revision_hash = _required_digest(
+                model.payload.get("variant_revision"), "Model Variant revision"
+            )
+            revision = self._typed(revision_hash, "variant_revision")
+            if revision.payload.get("variant") != variant_hash:
+                raise ContractError("v2 Model revision ownership mismatch")
+        for (scope, _), target in bindings.items():
+            run_owner = _scoped_hash(scope, "variant", "runs")
+            if (
+                target in attempts
+                and run_owner is not None
+                and run_owner != variant_hash
+            ):
+                raise ContractError("v2 Attempt has multiple active Variant owners")
+            model_owner = _scoped_hash(scope, "variant", "models")
+            if (
+                target in model_hashes
+                and model_owner is not None
+                and model_owner != variant_hash
+            ):
+                raise ContractError("v2 Model has multiple active Variant owners")
+
+    def _derived_variants(
+        self,
+        variant_hash: str,
+        contexts: dict[str, _VariantContext],
+    ) -> tuple[DerivedVariant, ...]:
+        active = set(contexts)
+        current_revisions = {
+            digest: self.graph.current_revision(digest) for digest in active
+        }
+        active_parents = {
+            digest: self._effective_active_parent(
+                current_revisions[digest], active, excluded=frozenset()
+            )
+            for digest in active
+        }
+        self._validate_active_lineage(active_parents)
+        result: list[DerivedVariant] = []
+        for digest, context in contexts.items():
+            if digest == variant_hash:
+                continue
+            depth = 0
+            cursor = digest
+            seen: set[str] = set()
+            while (parent := active_parents.get(cursor)) is not None:
+                if cursor in seen:
+                    raise ContractError("v2 active Variant lineage contains a cycle")
+                seen.add(cursor)
+                depth += 1
+                if parent == variant_hash:
+                    current_parent = contexts[active_parents[digest]]
+                    after_hash = (
+                        self._effective_active_parent(
+                            current_revisions[digest],
+                            active,
+                            excluded=frozenset({variant_hash}),
+                        )
+                        if depth == 1
+                        else active_parents[digest]
+                    )
+                    result.append(
+                        DerivedVariant(
+                            experiment=context.experiment,
+                            variant=context.variant,
+                            address=self._context_address(context),
+                            relation="direct" if depth == 1 else "transitive",
+                            depth=depth,
+                            current_parent=self._context_address(current_parent),
+                            effective_parent_after=(
+                                self._context_address(contexts[after_hash])
+                                if after_hash is not None
+                                else None
+                            ),
+                        )
+                    )
+                    break
+                cursor = parent
+        return tuple(
+            sorted(
+                result,
+                key=lambda item: (item.depth, item.address.encode("utf-8")),
+            )
+        )
+
+    @staticmethod
+    def _validate_active_lineage(active_parents: dict[str, str | None]) -> None:
+        for start in active_parents:
+            current: str | None = start
+            seen: set[str] = set()
+            while current is not None:
+                if current in seen:
+                    raise ContractError("v2 active Variant lineage contains a cycle")
+                seen.add(current)
+                current = active_parents.get(current)
+
+    def _effective_active_parent(
+        self,
+        revision_hash: str,
+        active: set[str],
+        *,
+        excluded: frozenset[str],
+    ) -> str | None:
+        current = revision_hash
+        seen: set[str] = set()
+        while True:
+            lineage = self._derivation_parent(current)
+            if lineage is None:
+                return None
+            parent_variant, parent_revision = lineage
+            if parent_variant in seen:
+                raise ContractError("v2 Variant derivation contains a cycle")
+            seen.add(parent_variant)
+            if parent_variant in active and parent_variant not in excluded:
+                return parent_variant
+            current = parent_revision
+
+    def _derivation_parent(self, revision_hash: str) -> tuple[str, str] | None:
+        current: str | None = revision_hash
+        owner: str | None = None
+        seen: set[str] = set()
+        while current is not None:
+            if current in seen:
+                raise ContractError("v2 Variant revision history contains a cycle")
+            seen.add(current)
+            revision = self._typed(current, "variant_revision")
+            variant_hash = _required_digest(
+                revision.payload.get("variant"), "Variant revision owner"
+            )
+            if owner is None:
+                owner = variant_hash
+            elif variant_hash != owner:
+                raise ContractError("v2 Variant revision parent ownership mismatch")
+            derivation = revision.payload.get("derivation_parent")
+            if derivation is not None:
+                derivation = _required_digest(derivation, "Variant derivation parent")
+                parent = self._typed(derivation, "variant_revision")
+                parent_variant = _required_digest(
+                    parent.payload.get("variant"), "Variant derivation owner"
+                )
+                return parent_variant, derivation
+            parent = revision.payload.get("parent")
+            current = (
+                None
+                if parent is None
+                else _required_digest(parent, "Variant revision parent")
+            )
+        return None
+
+    @staticmethod
+    def _context_address(context: _VariantContext) -> str:
+        return f"{context.experiment}/{context.variant}"
+
+    def _journal_entries(
+        self,
+        plan: VariantDeletionPlan,
+        transaction_dir: Path,
+    ) -> list[dict[str, Any]]:
+        result: list[dict[str, Any]] = []
+        sources = [
+            (
+                "variant",
+                f"{plan.experiment}/{plan.variant}",
+                plan.authored_path,
+                "authored-variant",
+            )
+        ]
+        sources.extend(
+            (
+                "outputs",
+                output_path,
+                output_path,
+                f"generated-outputs/{index:04d}",
+            )
+            for index, output_path in enumerate(plan.output_paths)
+        )
+        for kind, address, source_path, target_name in sources:
+            target = _relative_to_root(
+                transaction_dir / "projection" / target_name,
+                self.repository.root,
+            )
+            result.append(
+                {
+                    "kind": kind,
+                    "address": address,
+                    "source": source_path,
+                    "target": target,
+                    "moved": False,
+                    "missing": False,
+                }
+            )
+        return result
+
+    def _failure_state(self, plan: VariantDeletionPlan) -> tuple[str, Path | None]:
+        journals = sorted(
+            self.trash_root.glob(
+                f"delete-{plan.plan_digest.removeprefix('sha256:')[:20]}-*/journal.json"
+            )
+        )
+        journal = journals[-1] if journals else None
+        try:
+            active = (
+                self.graph.bindings.resolve(
+                    experiment_variant_scope(plan.experiment_hash), plan.variant
+                )
+                == plan.variant_hash
+            )
+        except NotFoundError:
+            active = False
+        if not active:
+            return "deletion committed; recovery required", journal
+        if journal is None:
+            return "nothing changed", None
+        try:
+            phase = _load_json(journal, "deletion journal").get("phase")
+        except ContractError:
+            phase = None
+        if phase == "rolled_back":
+            return "rolled back successfully", journal
+        return "nothing committed; recovery required", journal
+
+
 DeletionService = RunDeletionService
 RunDeletionPlanner = RunDeletionService
+
+
+def _journal_experiment(document: dict[str, Any]) -> str | None:
+    for entry in document.get("entries", ()):
+        if entry.get("kind") == "experiment" and isinstance(entry.get("address"), str):
+            return str(entry["address"])
+    return None
+
+
+def _journal_variant(document: dict[str, Any]) -> tuple[str, str] | None:
+    for entry in document.get("entries", ()):
+        if entry.get("kind") != "variant" or not isinstance(entry.get("address"), str):
+            continue
+        pieces = str(entry["address"]).split("/")
+        if len(pieces) != 2 or not all(pieces):
+            raise ContractError("deletion journal Variant address is invalid")
+        return pieces[0], pieces[1]
+    return None
 
 
 def _required_digest(value: Any, location: str) -> str:

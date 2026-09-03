@@ -87,6 +87,7 @@ class GraphReplay:
         old = self.reader.object(digest, "variant_revision")
         parent = self.code(old.get("parent"))
         derivation = self.code(old.get("derivation_parent"))
+        merge = self.code(old.get("merge_parent"))
         source = self.reader.object(old["source_tree"], "source_tree")
         for entry in source.get("files", []):
             self.store.verify_blob(entry["blob"])
@@ -95,17 +96,20 @@ class GraphReplay:
             for key in ("variant", "template", "source_tree", "components")
         }
         payload.update(parent=parent, derivation_parent=derivation)
+        if merge is not None:
+            payload["merge_parent"] = merge
 
         def semantic(value):
             return {
                 key: item
                 for key, item in value.items()
-                if key not in {"parent", "derivation_parent"}
+                if key not in {"parent", "derivation_parent", "merge_parent"}
             }
 
         if (
             parent is not None
             and derivation is None
+            and merge is None
             and semantic(payload) == semantic(self.payload(parent, "variant_revision"))
         ):
             mapped = parent

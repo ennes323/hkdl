@@ -21,6 +21,11 @@ from ..storage import (
 from .objects import ObjectStore
 
 BindingAction = Literal["bind", "unbind"]
+_ANY_HEAD = object()
+
+
+class BindingHeadConflict(RuntimeError):
+    """The binding HEAD changed before a conditional transaction committed."""
 
 
 @dataclass(frozen=True)
@@ -180,7 +185,12 @@ class BindingLog:
             current = payload["previous"]
         return tuple(sorted(names, key=lambda item: item.encode("utf-8")))
 
-    def commit(self, operations: list[BindingOperation]) -> str:
+    def commit(
+        self,
+        operations: list[BindingOperation],
+        *,
+        expected_head: str | None | object = _ANY_HEAD,
+    ) -> str:
         if not operations:
             raise ContractError("binding transaction requires an operation")
         self.store._ensure_layout()
@@ -190,6 +200,8 @@ class BindingLog:
         descriptor = lock_directory(self.root)
         try:
             previous = self.head()
+            if expected_head is not _ANY_HEAD and previous != expected_head:
+                raise BindingHeadConflict("binding HEAD changed before commit")
             current = self.bindings(previous)
             _apply_operations(current, operations)
             timestamp = self._now()

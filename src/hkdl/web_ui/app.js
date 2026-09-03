@@ -12,6 +12,7 @@ const state = {
   document: null,
   selectedVariant: null,
   view: "overview",
+  overviewTarget: "variant",
   runDetail: { address: null, metric: null, response: null, loading: false, error: null, request: 0 },
   comparison: {
     selectedRuns: [],
@@ -40,6 +41,7 @@ const elements = {
   changesView: document.getElementById("changes-view"),
   error: document.getElementById("error"),
   experimentName: document.getElementById("experiment-name"),
+  experimentButton: document.getElementById("experiment-button"),
   experimentMeta: document.getElementById("experiment-meta"),
   currentCount: document.getElementById("current-count"),
   currentVariants: document.getElementById("current-variants"),
@@ -287,7 +289,7 @@ function normalizeModel(value) {
 
 function normalizeRun(value, index = 0) {
   const run = isObject(value) ? value : {};
-  const model = normalizeModel(
+  const candidateModel = normalizeModel(
     firstPresent(
       run.model,
       run.produced_model,
@@ -298,6 +300,11 @@ function normalizeRun(value, index = 0) {
       run.model_ref,
     ),
   );
+  // A seed may contain failed/retried Train Runs. Only its exact producer owns the Model.
+  const runId = firstPresent(run.run_id, run.name);
+  const model = candidateModel?.producer_run === runId && typeof runId === "string"
+    ? candidateModel : null;
+  const unverifiedModel = candidateModel && !candidateModel.producer_run ? candidateModel : null;
   const directEvaluations = normalizeArtifactList(
     firstPresent(
       run.evaluations,
@@ -333,8 +340,11 @@ function normalizeRun(value, index = 0) {
     action: stringValue(firstPresent(run.action, run.kind, run.type), "Run"),
     status: stringValue(firstPresent(run.status, run.lifecycle?.status), "unknown"),
     model,
-    evaluations: directEvaluations.length ? directEvaluations : model?.evaluations || [],
-    exports: directExports.length ? directExports : model?.exports || [],
+    unverifiedModel,
+    unverifiedEvaluations: unverifiedModel ? directEvaluations.length ? directEvaluations : unverifiedModel.evaluations || [] : [],
+    unverifiedExports: unverifiedModel ? directExports.length ? directExports : unverifiedModel.exports || [] : [],
+    evaluations: candidateModel && !model ? [] : directEvaluations.length ? directEvaluations : model?.evaluations || [],
+    exports: candidateModel && !model ? [] : directExports.length ? directExports : model?.exports || [],
   };
 }
 
@@ -342,22 +352,21 @@ function legacyRuns(historyVariant) {
   const runs = [];
   for (const group of arrayValue(historyVariant?.training_groups)) {
     for (const seed of arrayValue(group.seeds)) {
-      for (const run of arrayValue(seed.runs)) {
-        runs.push({
-          ...run,
-          comparison_group: group.name,
-          seed: seed.seed,
-          model: seed.model,
-        });
+      const records = arrayValue(seed.runs);
+      const trains = records.filter(run => comparisonAction(run.action) === "train");
+      const model = seed.model ? {
+        ...seed.model,
+        evaluations: records.filter(run => comparisonAction(run.action) === "eval"),
+        exports: records.filter(run => comparisonAction(run.action) === "export"),
+      } : null;
+      for (const run of trains) {
+        runs.push({ ...run, comparison_group: group.name, seed: seed.seed, model });
       }
-      if (seed.model && !seed.runs.length) {
-        runs.push({
-          action: "Train",
-          comparison_group: group.name,
-          seed: seed.seed,
-          model: seed.model,
-          status: "done",
-        });
+      if (!trains.length && model?.producer_run) {
+        runs.push({ run_id: model.producer_run, action: "Train", comparison_group: group.name,
+          seed: seed.seed, model, status: "done" });
+      } else if (!model) {
+        runs.push(...records.filter(run => comparisonAction(run.action) !== "train"));
       }
     }
   }
@@ -514,6 +523,18 @@ function formatObserved(value) {
     : `Observed ${parsed.toLocaleString()}`;
 }
 
+function variantRunCount(variant) {
+  const ids = new Set();
+  for (const run of variant.runs) {
+    for (const record of [run, ...arrayValue(run.evaluations), ...arrayValue(run.exports),
+      ...arrayValue(run.unverifiedEvaluations), ...arrayValue(run.unverifiedExports)]) {
+      const id = firstPresent(record.run_id, record.name);
+      if (typeof id === "string") ids.add(id);
+    }
+  }
+  return ids.size;
+}
+
 function variantButton(variant, selected, onSelect) {
   const button = node("button", "variant-button");
   button.type = "button";
@@ -522,26 +543,31 @@ function variantButton(variant, selected, onSelect) {
   button.addEventListener("click", onSelect);
   const row = node("span", "variant-button-row");
   row.append(node("span", "variant-button-name", variant.name));
-  row.append(
-    statusPill(stateLabel(variant.codeState, "Code"), variant.codeState, "compact"),
-  );
   button.append(row);
-  if (variant.runs.length > 0) {
-    button.append(
-      node(
-        "span",
-        "variant-button-meta",
-        `${variant.runs.length} ${variant.runs.length === 1 ? "Run" : "Runs"}`,
-      ),
-    );
-  }
+  const count = variantRunCount(variant);
+  button.append(node("span", "variant-button-meta", count ? `${count} ${count === 1 ? "Run" : "Runs"}` : "No Runs"));
   return button;
 }
 
 function selectVariant(name) {
   state.selectedVariant = name;
-  if (state.view === "run") selectView("overview");
-  render();
+  state.overviewTarget = "variant";
+  selectView("overview");
+  focusOverviewHeading();
+}
+
+function selectExperiment() {
+  state.overviewTarget = "experiment";
+  selectView("overview");
+  focusOverviewHeading();
+}
+
+function focusOverviewHeading() {
+  const heading = elements.detail.querySelector("h2");
+  if (heading) {
+    heading.tabIndex = -1;
+    heading.focus();
+  }
 }
 
 function renderTree(data) {
@@ -551,7 +577,7 @@ function renderTree(data) {
     ...data.currentVariants.map((variant) =>
       variantButton(
         variant,
-        state.selectedVariant === variant.name,
+        state.overviewTarget === "variant" && state.view !== "compare" && state.view !== "changes" && state.selectedVariant === variant.name,
         () => selectVariant(variant.name),
       ),
     ),
@@ -560,7 +586,7 @@ function renderTree(data) {
     ...data.historicalVariants.map((variant) =>
       variantButton(
         variant,
-        state.selectedVariant === variant.name,
+        state.overviewTarget === "variant" && state.view !== "compare" && state.view !== "changes" && state.selectedVariant === variant.name,
         () => selectVariant(variant.name),
       ),
     ),
@@ -591,12 +617,6 @@ function renderExperimentSummary(experiment, variantCount) {
     node("span", "eyebrow", "Experiment"),
     node("h2", "section-title", experiment.name),
   );
-  title.append(
-    statusPill(
-      stateLabel(experiment.commitState, "Experiment"),
-      experiment.commitState,
-    ),
-  );
   header.append(title);
   const identity = identityDetails("Experiment identity", experiment);
   if (identity) header.append(identity);
@@ -626,108 +646,75 @@ function renderExperimentSummary(experiment, variantCount) {
 }
 
 function renderCodeCard(variant) {
-  const section = node("section", "input-card code-card");
-  const header = node("div", "card-header");
-  header.append(node("h3", "card-title", "Code"));
-  header.append(statusPill(stateLabel(variant.codeState, "Code"), variant.codeState));
+  const section = node("section", "input-group code-card");
+  const header = node("div", "input-group-header");
+  header.append(node("h4", "card-title", "Code"));
   section.append(header);
-  const reason = firstPresent(
-    variant.code?.lock_reason,
-    variant.lock_reason,
-    variant.status?.lock_reason,
-  );
+  const labels = { clean: "Clean", uncommitted: "Uncommitted", locked: "Locked", unknown: "Unavailable" };
+  const rows = [["State", labels[variant.codeState] || "Unavailable"],
+    ...summaryRows(variant.code, { exclude: ["state"] })];
+  section.append(renderFacts(rows, "facts compact-facts"));
+  const reason = firstPresent(variant.code?.lock_reason, variant.lock_reason, variant.status?.lock_reason);
   if (reason) section.append(node("p", "card-note", reason));
-  const rows = summaryRows(variant.code, { exclude: ["state"] });
-  if (rows.length) section.append(renderFacts(rows, "facts compact-facts"));
-  else section.append(node("p", "card-note", "Code summary is not available."));
   const identity = identityDetails("Code identity", variant.code, variant);
   if (identity) section.append(identity);
   return section;
 }
 
 function renderOptionsCard(variant) {
-  const section = node("section", "input-card options-card");
-  const header = node("div", "card-header");
-  header.append(node("h3", "card-title", "Options"));
-  header.append(node("span", "card-context", "Run snapshot source"));
+  const section = node("section", "input-group options-card");
+  const header = node("div", "input-group-header");
+  header.append(node("h4", "card-title", "Options"));
   section.append(header);
-  const rows = summaryRows(variant.options, {
-    exclude: ["tracker", "seed", "device"],
-  });
+  const rows = summaryRows(variant.options, { exclude: ["tracker", "seed", "device"] });
   if (rows.length) section.append(renderFacts(rows, "facts compact-facts"));
   else section.append(node("p", "card-note", "No current options recorded."));
-  const identity = identityDetails(
-    "Options identity",
-    variant.options,
-    variant.option_set,
-  );
+  const identity = identityDetails("Options identity", variant.options, variant.option_set);
   if (identity) section.append(identity);
   return section;
 }
 
 function renderDownstreamItem(item, action) {
   const value = isObject(item) ? item : {};
-  const article = node(
-    "article",
-    `downstream-item downstream-${action.toLowerCase()}`,
-  );
+  const entry = node("li", `downstream-item downstream-${action.toLowerCase()}`);
   const header = node("div", "downstream-header");
-  header.append(
-    node(
-      "h5",
-      "downstream-name",
-      stringValue(firstPresent(value.display_name, value.name, value.label), humanizeKey(action)),
-    ),
-  );
-  header.append(statusPill(statusLabel(value.status), value.status || "unknown"));
-  article.append(header);
-  const inspect = runDetailButton(value);
-  if (inspect) article.append(inspect);
-  const metric = metricText(value);
-  if (metric) article.append(node("p", "secondary", metric));
-  const identity = identityDetails(`${action} identity`, value);
-  if (identity) article.append(identity);
-  return article;
+  const name = stringValue(firstPresent(value.run_id, value.display_name, value.name, value.label), humanizeKey(action));
+  const heading = node("h6", "downstream-name");
+  const inspect = runDetailButton({ ...value, name });
+  if (inspect) {
+    inspect.className = "run-link";
+    inspect.textContent = name;
+    heading.append(inspect);
+  } else heading.textContent = name;
+  const status = stringValue(value.status, "unknown").toLowerCase();
+  const label = ["done", "complete", "completed"].includes(status) ? "Complete" : statusLabel(status);
+  const dot = node("span", `downstream-status status-${status}`);
+  dot.setAttribute("role", "img");
+  dot.setAttribute("aria-label", label);
+  dot.title = label;
+  header.append(heading, dot);
+  entry.append(header);
+  return entry;
 }
 
 function renderModel(model, run) {
-  if (!model) return null;
-  const section = node("section", "model-card");
-  const header = node("div", "lineage-header");
-  header.append(
-    node("span", "lineage-kind", "Model"),
-    node("h4", "lineage-name", model.name),
-  );
-  const modelStatus = stringValue(model.status, "done");
-  header.append(statusPill(statusLabel(modelStatus), modelStatus));
-  section.append(header);
-  const facts = [];
-  if (model.producer_run || run.name) {
-    facts.push(["Produced by", stringValue(model.producer_run, run.name)]);
-  }
-  if (model.seed !== undefined || run.seed !== undefined) {
-    facts.push(["Seed", firstPresent(model.seed, run.seed)]);
-  }
-  if (facts.length) section.append(renderFacts(facts, "facts lineage-facts"));
+  // The Model is a fact, not another nesting level. Only results branch.
   const downstream = node("div", "downstream");
-  const evaluations = arrayValue(model.evaluations);
-  const exports = arrayValue(model.exports);
-  if (evaluations.length) {
+  for (const [title, action, records] of [
+    ["Evaluations", "Eval", run.evaluations],
+    ["Exports", "Export", run.exports],
+  ]) {
+    if (!arrayValue(records).length) continue;
     const group = node("section", "downstream-group");
-    group.append(node("h5", "downstream-title", "Evaluations"));
-    group.append(...evaluations.map((item) => renderDownstreamItem(item, "Eval")));
+    group.append(node("h5", "downstream-title", title));
+    const list = node("ul", "downstream-list");
+    list.setAttribute("aria-label", model
+      ? `${title} of the Model produced by ${run.name}` : `${title} connected to ${run.name}`);
+    list.append(...records.map(item => renderDownstreamItem(item, action)));
+    group.append(list);
     downstream.append(group);
   }
-  if (exports.length) {
-    const group = node("section", "downstream-group");
-    group.append(node("h5", "downstream-title", "Exports"));
-    group.append(...exports.map((item) => renderDownstreamItem(item, "Export")));
-    downstream.append(group);
-  }
-  if (downstream.childElementCount) section.append(downstream);
-  const identity = identityDetails("Model identity", model);
-  if (identity) section.append(identity);
-  return section;
+  return downstream.childElementCount ? downstream : null;
 }
 
 function renderRunSnapshots(run) {
@@ -751,47 +738,50 @@ function renderRunSnapshots(run) {
   return section;
 }
 
+function overviewRunState(status) {
+  return ["done", "complete", "completed"].includes(String(status).toLowerCase())
+    ? "Not running" : statusLabel(status);
+}
+
 function renderRun(run) {
   const article = node("article", "run-card");
   const header = node("div", "run-header");
   const title = node("div", "run-title");
-  title.append(
-    node("span", "lineage-kind", run.action),
+  title.append(node("span", "lineage-kind", run.action),
     node("h4", "lineage-name", run.name),
-  );
-  header.append(title, statusPill(statusLabel(run.status), run.status));
-  article.append(header);
+    node("span", "run-state", overviewRunState(run.status)));
+  header.append(title);
   const inspect = runDetailButton(run);
-  if (inspect) article.append(inspect);
+  if (inspect) header.append(inspect);
+  article.append(header);
   const facts = [];
-  if (run.seed !== undefined) facts.push(["Seed", run.seed]);
-  if (run.comparison_group) facts.push(["Comparison", run.comparison_group]);
-  if (run.created_at) facts.push(["Created", run.created_at]);
-  const metric = metricText(run);
-  if (metric) facts.push(["Metric", metric]);
-  if (facts.length) article.append(renderFacts(facts, "facts run-facts"));
-  const snapshots = renderRunSnapshots(run);
-  if (snapshots) article.append(snapshots);
-  const model = renderModel(run.model, run);
-  if (model) article.append(model);
-  const directEvaluations = arrayValue(run.evaluations).filter(
-    (item) => !run.model?.evaluations?.includes(item),
-  );
-  const directExports = arrayValue(run.exports).filter(
-    (item) => !run.model?.exports?.includes(item),
-  );
-  if (directEvaluations.length || directExports.length) {
-    const direct = node("div", "downstream direct-downstream");
-    if (directEvaluations.length) {
-      direct.append(...directEvaluations.map((item) => renderDownstreamItem(item, "Eval")));
-    }
-    if (directExports.length) {
-      direct.append(...directExports.map((item) => renderDownstreamItem(item, "Export")));
-    }
-    article.append(direct);
+  if (isTrainRun(run)) facts.push(["Model", run.model
+    ? stringValue(firstPresent(run.model.model_id, run.model.name), "Not recorded")
+    : run.unverifiedModel ? "Producer not recorded" : "Not produced"]);
+  facts.push(["Seed", firstPresent(run.seed, "Not recorded")], ["Metric", metricText(run) || "Not recorded"]);
+  article.append(renderFacts(facts, "facts run-facts"));
+  if (["allocated", "running"].includes(run.status)) {
+    article.append(node("p", "run-notice secondary", "Recorded active. Process liveness is unknown."));
   }
-  const identity = identityDetails("Run identity", run);
-  if (identity) article.append(identity);
+  const results = renderModel(run.model, run);
+  if (results) article.append(results);
+  if (run.unverifiedModel) {
+    const details = node("details", "identity-details unverified-results");
+    details.append(node("summary", "identity-summary", "Unverified Model reference"));
+    details.append(node("p", "secondary", "The legacy response does not record a producer. These results are not shown as this Train Run's output."));
+    const identity = identityDetails("Model identity", run.unverifiedModel);
+    if (identity) details.append(identity);
+    for (const [action, records] of [["Eval", run.unverifiedEvaluations], ["Export", run.unverifiedExports]]) {
+      for (const record of records) {
+        const inspect = runDetailButton(record);
+        if (inspect) {
+          inspect.textContent = `${action} · ${firstPresent(record.run_id, record.name)}`;
+          details.append(inspect);
+        }
+      }
+    }
+    article.append(details);
+  }
   return article;
 }
 
@@ -971,7 +961,7 @@ function renderRuns(variant) {
     node(
       "span",
       "section-count",
-      `${variant.runs.length} ${variant.runs.length === 1 ? "Run" : "Runs"}`,
+      `${variant.runs.length} ${variant.runs.every(isTrainRun) ? "Train " : ""}${variant.runs.length === 1 ? "Run" : "Runs"}`,
     ),
   );
   section.append(header);
@@ -993,14 +983,17 @@ function renderVariantDetail(variant) {
     node("span", "eyebrow", "Variant"),
     node("h2", "variant-title", variant.name),
   );
-  title.append(statusPill(stateLabel(variant.codeState, "Code"), variant.codeState));
   header.append(title);
   const identity = identityDetails("Variant identity", variant);
   if (identity) header.append(identity);
   section.append(header);
-  const inputs = node("div", "input-grid");
-  inputs.append(renderCodeCard(variant), renderOptionsCard(variant));
-  section.append(inputs, renderRuns(variant));
+  const inputs = node("section", "inputs-section");
+  const inputsHeader = node("div", "section-header");
+  inputsHeader.append(node("h3", "section-title", "Inputs"));
+  const grid = node("div", "inputs-grid");
+  grid.append(renderCodeCard(variant), renderOptionsCard(variant));
+  inputs.append(inputsHeader, grid);
+  section.append(inputs, renderRuns(variant), renderVariantMetrics(variant));
   if (variant.history_only || variant.historical_only) {
     section.append(
       node(
@@ -1342,6 +1335,393 @@ const COMPARISON_COLORS = [
   "var(--hkdl-good)",
   "var(--hkdl-bad)",
 ];
+
+// Configuration lives only in this page; responses belong to one active selection.
+const variantMetricConfigs = new Map();
+const variantMetricRequests = { active: null, queue: [], running: 0, nextId: 1 };
+const variantMetricPlots = new WeakMap();
+const variantMetricResize = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(entries => {
+  for (const entry of entries) {
+    const width = Math.max(200, Math.round(entry.contentRect.width));
+    const plot = variantMetricPlots.get(entry.target);
+    if (!plot || entry.target.getAttribute("viewBox") === `0 0 ${width} 226`) continue;
+    const resized = renderVariantMetricPlot(plot.series, plot.id, width);
+    entry.target.setAttribute("viewBox", resized.getAttribute("viewBox"));
+    entry.target.replaceChildren(...resized.childNodes);
+  }
+});
+
+function observeVariantMetricPlots() {
+  variantMetricResize?.disconnect();
+  if (variantMetricResize) for (const svg of elements.detail.querySelectorAll(".variant-metrics svg")) variantMetricResize.observe(svg);
+}
+
+function variantMetricConfig(variant) {
+  const key = JSON.stringify([state.document?.experiment.name, variant.name]);
+  const records = comparisonRunRecords(state.document).filter(record => record.variant === variant.name);
+  if (!variantMetricConfigs.has(key)) {
+    variantMetricConfigs.set(key, { key, selected: records.slice(0, 1).map(record => record.key), charts: [], initialized: false, colors: new Map() });
+  }
+  const config = variantMetricConfigs.get(key);
+  config.records = records;
+  config.selected = config.selected.filter(key => records.some(record => record.key === key));
+  for (const key of config.colors.keys()) if (!config.selected.includes(key)) config.colors.delete(key);
+  for (const key of config.selected) {
+    if (!config.colors.has(key)) {
+      config.colors.set(key, [0, 1, 2, 3].find(slot => ![...config.colors.values()].includes(slot)));
+    }
+  }
+  return config;
+}
+
+function activeVariantMetricConfig() {
+  if (!state.document || state.view !== "overview" || state.overviewTarget !== "variant") return null;
+  const variant = state.document.experiment.variants.find(item => item.name === state.selectedVariant);
+  return variant ? variantMetricConfig(variant) : null;
+}
+
+function invalidateVariantMetrics() {
+  variantMetricResize?.disconnect();
+  const active = variantMetricRequests.active;
+  variantMetricRequests.active = null;
+  variantMetricRequests.queue = [];
+  if (active) for (const request of active.data.values()) request.controller?.abort();
+}
+
+function newVariantMetricChart(metric = "") {
+  return { id: variantMetricRequests.nextId++, metric, overlay: false, expanded: false };
+}
+
+function variantMetricPeer(metric) {
+  return metric === "train.loss" ? "val.loss" : metric === "val.loss" ? "train.loss" : null;
+}
+
+function syncVariantMetrics() {
+  const config = activeVariantMetricConfig();
+  if (!config) { invalidateVariantMetrics(); return; }
+  const selection = JSON.stringify([config.key, config.selected]);
+  if (variantMetricRequests.active?.selection !== selection) {
+    const previous = variantMetricRequests.active;
+    const frames = previous?.config === config && config.selected.length ? previous.frames : new Map();
+    invalidateVariantMetrics();
+    variantMetricRequests.active = { config, selection, records: config.selected.map(key => config.records.find(record => record.key === key)), data: new Map(), names: null, frames, generation: Symbol() };
+  }
+  const active = variantMetricRequests.active;
+  for (const id of active.frames.keys()) if (!config.charts.some(chart => chart.id === id)) active.frames.delete(id);
+  if (!active.records.length) return;
+  const wanted = new Set([null]);
+  if (active.names !== null) {
+    for (const chart of config.charts) {
+      if (active.names.includes(chart.metric)) wanted.add(chart.metric);
+      const peer = variantMetricPeer(chart.metric);
+      if (chart.overlay && active.names.includes(peer)) wanted.add(peer);
+    }
+  }
+  // Removed charts do not start queued work; in-flight results remain selection-scoped.
+  variantMetricRequests.queue = variantMetricRequests.queue.filter(job => {
+    if (job.active === active && wanted.has(job.metric)) return true;
+    job.active.data.delete(job.metric);
+    return false;
+  });
+  for (const metric of wanted) {
+    if (active.data.has(metric)) continue;
+    const request = { status: "loading", response: null, error: null };
+    active.data.set(metric, request);
+    variantMetricRequests.queue.push({ active, metric, request });
+  }
+  pumpVariantMetrics();
+}
+
+function pumpVariantMetrics() {
+  while (variantMetricRequests.running < 2 && variantMetricRequests.queue.length) {
+    const job = variantMetricRequests.queue.shift();
+    if (job.active !== variantMetricRequests.active) continue;
+    variantMetricRequests.running += 1;
+    readVariantMetric(job).finally(() => {
+      variantMetricRequests.running -= 1;
+      pumpVariantMetrics();
+    });
+  }
+}
+
+async function readVariantMetric({ active, metric, request }) {
+  request.controller = new AbortController();
+  const params = new URLSearchParams();
+  for (const record of active.records) params.append("run", record.address);
+  if (metric !== null) params.set("metric", metric);
+  const endpoint = active.records.length === 1 ? "run" : "comparison";
+  try {
+    const response = await fetch(`/api/v1/${endpoint}?${params}`, { headers: { Accept: "application/json" }, cache: "no-store", signal: request.controller.signal });
+    const body = await response.json();
+    if (active !== variantMetricRequests.active) return;
+    if (!response.ok) throw new Error(body?.error?.message || `request failed (${response.status})`);
+    const value = endpoint === "run" ? validateRunDetail(body, active.records[0].address).chart : normalizeComparisonResponse(body, active.records);
+    if (!value || (metric !== null && value.metric !== metric)) throw new Error("Response changed the requested metric");
+    if ((value.metric === null) !== (value.metric_names.length === 0)) throw new Error("Inconsistent default metric selection");
+    for (const run of value.runs) {
+      if (run.points_returned > 2000 || (run.availability === "available") !== (run.series.length > 0) || (!run.series.length && run.points_total !== 0)) throw new Error("Inconsistent recorded metric availability or point limit");
+      // Run-detail validation uses the address as key; use the shared selection identity.
+      run.key = active.records.find(record => record.address === run.address).key;
+    }
+    request.status = "ready";
+    request.response = value;
+    if (metric === null) {
+      active.names = value.metric_names;
+      if (value.metric !== null) active.data.set(value.metric, request);
+      if (!active.config.initialized) {
+        const names = [value.metric, ...value.metric_names.filter(name => name !== value.metric)].filter(name => name !== null);
+        active.config.charts = names.slice(0, 2).map(newVariantMetricChart);
+        active.config.initialized = true;
+      }
+    }
+  } catch (error) {
+    if (active !== variantMetricRequests.active) return;
+    request.status = "error";
+    request.error = `Could not read metrics: ${error.message}. Use Refresh to retry.`;
+  }
+  if (active === variantMetricRequests.active) {
+    syncVariantMetrics();
+    redrawVariantMetrics();
+  }
+}
+
+function redrawVariantMetrics(focusId = null, revealFocus = false) {
+  const config = activeVariantMetricConfig();
+  const old = elements.detail.querySelector(".variant-metrics");
+  if (!config || !old) return;
+  const focused = focusId || (old.contains(document.activeElement) ? document.activeElement.id : null);
+  const variant = state.document.experiment.variants.find(item => item.name === state.selectedVariant);
+  const replacement = renderVariantMetrics(variant);
+  const active = variantMetricRequests.active;
+  if (active?.config === config && [...active.data.values()].some(request => request.status === "loading")) {
+    // Do not temporarily shorten the page while recorded plots are reloading:
+    // browsers clamp scroll position before the new response can restore them.
+    replacement.style.minHeight = `${old.getBoundingClientRect().height}px`;
+  }
+  old.replaceWith(replacement);
+  observeVariantMetricPlots();
+  if (focused) document.getElementById(focused)?.focus({ preventScroll: !revealFocus });
+}
+
+function renderVariantMetrics(variant) {
+  const config = variantMetricConfig(variant);
+  const active = variantMetricRequests.active?.config === config ? variantMetricRequests.active : null;
+  const section = node("section", "metric-workspace variant-metrics");
+  section.setAttribute("aria-label", "Variant metrics");
+  const heading = node("div", "mw-heading");
+  const add = node("button", "mw-action", "Add chart");
+  add.type = "button";
+  add.id = "variant-metric-add";
+  add.addEventListener("click", () => {
+    config.initialized = true;
+    const chart = newVariantMetricChart();
+    config.charts.push(chart);
+    syncVariantMetrics();
+    redrawVariantMetrics(`variant-metric-${chart.id}`, true);
+  });
+  heading.append(node("h3", "section-title", "Metrics"), add);
+  section.append(heading);
+  const runs = node("fieldset", "mw-runs");
+  runs.append(node("legend", "", "Runs · select up to 4"));
+  for (const record of config.records) {
+    const label = node("label", "mw-check");
+    const input = node("input");
+    input.type = "checkbox";
+    input.id = `variant-metric-run-${config.records.indexOf(record)}`;
+    input.checked = config.selected.includes(record.key);
+    input.disabled = !input.checked && config.selected.length >= 4;
+    input.addEventListener("change", () => {
+      if (input.checked && config.selected.length < 4) config.selected.push(record.key);
+      else config.selected = config.selected.filter(key => key !== record.key);
+      syncVariantMetrics();
+      redrawVariantMetrics(input.id);
+    });
+    label.append(input, node("span", "", record.id));
+    runs.append(label);
+  }
+  section.append(runs);
+  const grid = node("div", "mw-grid");
+  const cards = config.charts.map(chart => renderVariantMetricCard(config, chart, active));
+  grid.append(...cards);
+  if (!config.records.length) section.append(node("p", "mw-note", "No Train Runs are available."));
+  else if (!config.selected.length) section.append(node("p", "mw-note", "Select a Run to view recorded metrics."));
+  else if (active?.data.get(null)?.error) {
+    const note = node("p", "mw-note", active.data.get(null).error);
+    note.setAttribute("role", "alert");
+    section.append(note);
+  } else if (active?.names?.length === 0) section.append(node("p", "mw-note", "No metrics were recorded for the selected Runs."));
+  else if ((!active?.names || cards.some(card => card.dataset.state === "loading")) && !cards.some(card => card.dataset.state === "updating")) {
+    const note = node("p", "mw-note", "Loading metrics…");
+    note.setAttribute("role", "status");
+    section.append(note);
+  }
+  section.append(grid);
+  if (config.initialized && !config.charts.length) section.append(node("p", "mw-note", "No charts. Use Add chart to choose a metric."));
+  return section;
+}
+
+function variantMetricPresentation(config, chart, active) {
+  const signature = JSON.stringify([chart.metric, chart.overlay]);
+  const frame = active?.frames.get(chart.id);
+  if (frame?.signature !== signature) active?.frames.delete(chart.id);
+  let series = [], notes = [];
+  let pending = false, failed = Boolean(active?.data.get(null)?.error);
+  if (!config.selected.length || !chart.metric) {
+    active?.frames.delete(chart.id);
+    return { series, notes, pending, previous: false };
+  }
+  for (const metric of [chart.metric, ...(chart.overlay ? [variantMetricPeer(chart.metric)] : [])]) {
+    const request = active?.data.get(metric);
+    if (active?.names && !active.names.includes(metric)) {
+      notes.push({ text: `${metric}: Not recorded for the selected Runs.` });
+    } else if (request?.status === "error") {
+      notes.push({ text: `${metric}: ${request.error}`, error: true });
+      failed = true;
+    } else if (request?.status !== "ready") {
+      pending = !active?.data.get(null)?.error;
+    } else {
+      series.push(...request.response.runs.map(run => ({ ...run, metric, color: COMPARISON_COLORS[config.colors.get(run.key)], dashed: metric === "val.loss" })));
+    }
+  }
+  const previous = pending && !failed && frame?.signature === signature && frame.generation !== active.generation;
+  if (previous) {
+    // Keep the entire prior chart together: never mix old and new Run selections,
+    // or recolor the prior legend using the newly selected Runs' color slots.
+    series = frame.series;
+    notes = frame.notes;
+  } else if (active && (!pending || failed)) {
+    active.frames.delete(chart.id);
+    if (!failed && series.some(run => run.series.length)) active.frames.set(chart.id, { signature, generation: active.generation, series, notes });
+  }
+  return { series, notes, pending, previous: Boolean(previous) };
+}
+
+function renderVariantMetricCard(config, chart, active) {
+  const card = node("article", "mw-chart");
+  card.dataset.chartId = String(chart.id);
+  const heading = node("div", "mw-chart-heading");
+  const select = node("select", "mw-metric");
+  select.id = `variant-metric-${chart.id}`;
+  select.setAttribute("aria-label", `Metric for chart ${chart.id}`);
+  const names = [...new Set(["", ...(active?.names || []), ...(chart.metric ? [chart.metric] : [])])];
+  for (const name of names) {
+    const option = node("option", "", name || "Choose metric");
+    option.value = name;
+    option.selected = name === chart.metric;
+    select.append(option);
+  }
+  select.disabled = !config.selected.length || active?.names == null;
+  select.addEventListener("change", () => {
+    chart.metric = select.value;
+    chart.overlay = false;
+    chart.expanded = false;
+    syncVariantMetrics();
+    redrawVariantMetrics(select.id);
+  });
+  const remove = node("button", "mw-action mw-remove", "Remove");
+  remove.type = "button";
+  remove.setAttribute("aria-label", `Remove chart ${chart.id}`);
+  remove.addEventListener("click", () => {
+    config.charts = config.charts.filter(item => item.id !== chart.id);
+    config.initialized = true;
+    syncVariantMetrics();
+    redrawVariantMetrics("variant-metric-add", true);
+  });
+  heading.append(select, remove);
+  card.append(heading);
+  const plot = node("div", "mw-plot");
+  const { series, notes, pending, previous } = variantMetricPresentation(config, chart, active);
+  card.dataset.state = previous ? "updating" : pending ? "loading" : "ready";
+  plot.setAttribute("aria-busy", String(pending));
+  if (!config.selected.length || !chart.metric) {
+    plot.append(node("p", "mw-empty", !config.selected.length ? "Select a Run." : "Choose a metric for this chart."));
+  } else {
+    for (const note of notes) {
+      const message = node("p", "mw-note", note.text);
+      if (note.error) message.setAttribute("role", "alert");
+      plot.append(message);
+    }
+    if (series.some(run => run.series.length)) plot.append(renderVariantMetricPlot(series, chart.id));
+    else if (series.length) plot.append(node("p", "mw-empty", "No recorded points for this chart."));
+    const legend = node("ul", "mw-legend");
+    for (const run of series) {
+      const item = node("li", "mw-legend-item");
+      const swatch = node("span", "mw-swatch");
+      swatch.style.borderColor = run.color;
+      swatch.dataset.dashed = String(run.dashed);
+      swatch.setAttribute("aria-hidden", "true");
+      const availability = run.availability === "available" ? `${run.points_returned} of ${run.points_total} points${run.points_returned < run.points_total ? " · Downsampled (2,000-point limit)" : ""}${run.series.length === 1 ? " · One recorded point" : ""}` : run.availability === "tracking_disabled" ? "Tracking disabled" : "Not recorded";
+      item.append(swatch, node("span", "", `${run.id} · ${run.metric} · ${availability}${run.partial ? " · Partial recording" : ""}${run.last ? ` · Last: ${run.last.value} at step ${run.last.step}` : ""}`));
+      legend.append(item);
+    }
+    plot.append(legend);
+  }
+  card.append(plot);
+  if (previous) {
+    const notice = node("p", "mw-note", "Previous results · Updating…");
+    notice.setAttribute("role", "status");
+    card.append(notice);
+  }
+  const peer = variantMetricPeer(chart.metric);
+  if (peer) {
+    const details = node("details", "mw-overlay");
+    details.open = chart.expanded;
+    const summary = node("summary", "", "Overlay");
+    summary.id = `variant-overlay-toggle-${chart.id}`;
+    details.addEventListener("toggle", () => { chart.expanded = details.open; });
+    const label = node("label", "mw-check");
+    const input = node("input");
+    input.type = "checkbox";
+    input.id = `variant-overlay-${chart.id}`;
+    input.setAttribute("aria-label", `Overlay ${peer} on chart ${chart.id}`);
+    input.checked = chart.overlay;
+    input.addEventListener("change", () => {
+      chart.overlay = input.checked;
+      chart.expanded = true;
+      syncVariantMetrics();
+      redrawVariantMetrics(input.id);
+    });
+    label.append(input, node("span", "", peer));
+    details.append(summary, label, node("p", "mw-note", "Units unavailable. Raw values and recorded steps; no conversion. Metrics are read separately, not as an atomic snapshot."));
+    card.append(details);
+  }
+  return card;
+}
+
+function variantMetricDomain(series) {
+  const points = series.flatMap(run => run.series);
+  if (!points.length) return null;
+  let low = Infinity, high = -Infinity, maxStep = 0;
+  for (const point of points) {
+    low = Math.min(low, point.value); high = Math.max(high, point.value); maxStep = Math.max(maxStep, point.step);
+  }
+  const factor = Math.max(Math.abs(low), Math.abs(high)) || 1;
+  const min = low / factor, max = high / factor;
+  return { low, high, maxStep, factor, min, max, y: value => min === max ? 0.5 : (value / factor - min) / (max - min) };
+}
+
+function renderVariantMetricPlot(series, id, width = 500) {
+  const domain = variantMetricDomain(series);
+  const svg = svgElement("svg", { viewBox: `0 0 ${width} 226`, role: "img", "aria-labelledby": `variant-plot-${id}-title variant-plot-${id}-description` });
+  variantMetricPlots.set(svg, { series, id });
+  svg.append(svgElement("title", { id: `variant-plot-${id}-title` }, `Chart ${id}: ${[...new Set(series.map(run => run.metric))].join(" and ")}`));
+  svg.append(svgElement("desc", { id: `variant-plot-${id}-description` }, "Raw values against recorded step. Missing records are not zero. Single records are points; straight segments connect recorded points without smoothing. Run and metric names and last values follow the chart."));
+  const left = 94, right = width - 16, top = 16, bottom = 186;
+  for (const fraction of domain.min === domain.max ? [0.5] : [0, 0.5, 1]) {
+    const y = bottom - fraction * (bottom - top);
+    const value = (domain.min * (1 - fraction) + domain.max * fraction) * domain.factor;
+    svg.append(svgElement("line", { x1: left, x2: right, y1: y, y2: y, class: "mw-axis" }));
+    svg.append(svgElement("text", { x: left - 8, y: y + 4, "text-anchor": "end", class: "mw-axis-label" }, Number(value.toPrecision(4)).toString()));
+  }
+  svg.append(svgElement("text", { x: left, y: 212, class: "mw-axis-label" }, "0"));
+  svg.append(svgElement("text", { x: right, y: 212, "text-anchor": "end", class: "mw-axis-label" }, `Step ${domain.maxStep}`));
+  for (const run of series) {
+    const coords = run.series.map(point => [left + (domain.maxStep ? point.step / domain.maxStep : 0.5) * (right - left), bottom - domain.y(point.value) * (bottom - top)]);
+    if (coords.length > 1) svg.append(svgElement("polyline", { points: coords.map(point => point.join(",")).join(" "), stroke: run.color, "stroke-dasharray": run.dashed ? "6 4" : "none", class: "mw-series" }));
+    if (coords.length === 1) svg.append(svgElement("circle", { cx: coords[0][0], cy: coords[0][1], r: 3, fill: run.color }));
+  }
+  return svg;
+}
 
 function comparisonAction(value) {
   return stringValue(value, "").toLowerCase().replace(/[ _-]+/g, "");
@@ -1850,11 +2230,12 @@ function renderInputDifferenceTable(rows, runs) {
   return table;
 }
 
-function svgElement(tagName, attributes = {}) {
+function svgElement(tagName, attributes = {}, text) {
   const element = document.createElementNS(COMPARISON_SVG_NS, tagName);
   for (const [name, value] of Object.entries(attributes)) {
     element.setAttribute(name, String(value));
   }
+  if (text !== undefined) element.textContent = String(text);
   return element;
 }
 
@@ -2066,7 +2447,7 @@ function renderMetricChart(response) {
       : response.partial
         ? "Partial data"
         : "Recorded data";
-  header.append(statusPill(stateText, response.unavailable ? "failed" : response.partial ? "partial" : "done"));
+  if (response.unavailable || response.partial || !hasPoints) header.append(node("span", "secondary", stateText));
   section.append(header);
   if (response.message) section.append(node("p", "comparison-result-note", response.message));
   if (response.unavailable) {
@@ -2302,7 +2683,7 @@ function renderComparison(data) {
   const titleHeader = node("div", "panel-header");
   const title = node("div", "panel-title");
   title.append(node("span", "eyebrow", "Experiment"), node("h2", "section-title", `${data.experiment.name} comparison`));
-  titleHeader.append(title, statusPill("Read only", "clean"));
+  titleHeader.append(title);
   section.append(titleHeader);
   section.append(node("p", "comparison-intro", "Select Train Runs across Variants to compare recorded metrics and their connected evaluation results."));
   section.append(renderComparisonRunPicker(data));
@@ -2350,6 +2731,7 @@ function ensureComparisonSelection() {
 
 function selectView(view) {
   if (!state.document) return;
+  invalidateVariantMetrics();
   state.runDetail.request += 1;
   state.runDetail.response = null;
   state.view = ["compare", "changes"].includes(view) ? view : "overview";
@@ -2425,9 +2807,11 @@ function renderDetail(data) {
     elements.detail.replaceChildren(renderAuthoring());
     return;
   }
-  elements.detail.replaceChildren(
-    renderExperimentSummary(data.experiment, data.experiment.variants.length),
-  );
+  if (state.overviewTarget === "experiment" || !state.selectedVariant) {
+    elements.detail.replaceChildren(renderExperimentSummary(data.experiment, data.experiment.variants.length));
+    return;
+  }
+  elements.detail.replaceChildren();
   if (!state.selectedVariant) {
     elements.detail.append(node("div", "empty-card", "No Variant identities are available."));
     return;
@@ -2455,13 +2839,16 @@ function render() {
   }
   elements.experimentContext.textContent = `${experiment.name} · ${experiment.type}`;
   elements.experimentName.textContent = experiment.name;
-  elements.experimentMeta.textContent = `${experiment.variants.length} ${experiment.variants.length === 1 ? "Variant" : "Variants"} · ${stateLabel(experiment.commitState, "Experiment")}`;
+  elements.experimentMeta.textContent = `${experiment.variants.length} ${experiment.variants.length === 1 ? "Variant" : "Variants"}`;
+  elements.experimentButton.setAttribute("aria-current", state.view === "overview" && (state.overviewTarget === "experiment" || !state.selectedVariant) ? "page" : "false");
   elements.observedAt.textContent = formatObserved(documentValue.observed_at);
   elements.overviewView.setAttribute("aria-pressed", String(state.view === "overview"));
   elements.compareView.setAttribute("aria-pressed", String(state.view === "compare"));
   elements.changesView.setAttribute("aria-pressed", String(state.view === "changes"));
   renderTree(data);
   renderDetail(data);
+  syncVariantMetrics();
+  observeVariantMetricPlots();
 }
 
 function clearRenderedState() {
@@ -2480,12 +2867,13 @@ function clearRenderedState() {
 }
 
 function setNavigationAvailable(available) {
-  for (const button of [elements.overviewView, elements.compareView, elements.changesView]) {
+  for (const button of [elements.overviewView, elements.compareView, elements.changesView, elements.experimentButton]) {
     button.disabled = !available;
   }
 }
 
 async function loadOverview() {
+  invalidateVariantMetrics();
   elements.refresh.disabled = true;
   setNavigationAvailable(false);
   elements.error.hidden = true;
@@ -2538,6 +2926,7 @@ elements.historyToggle.addEventListener("click", () => {
   elements.historyToggle.setAttribute("aria-expanded", String(!expanded));
   elements.historicalVariants.hidden = expanded;
 });
+elements.experimentButton.addEventListener("click", selectExperiment);
 elements.overviewView.addEventListener("click", () => selectView("overview"));
 elements.compareView.addEventListener("click", () => selectView("compare"));
 elements.changesView.addEventListener("click", () => selectView("changes"));

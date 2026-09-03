@@ -28,8 +28,10 @@
               Changes
             </button>
           </nav>
-          <span id="observed-at" class="observed-at" aria-live="polite"></span>
-          <button id="refresh" class="refresh" type="button">Refresh</button>
+          <div class="observation-actions">
+            <span id="observed-at" class="observed-at" aria-live="polite"></span>
+            <button id="refresh" class="refresh" type="button">Refresh</button>
+          </div>
         </div>
       </header>
 
@@ -37,9 +39,12 @@
 
       <div class="workspace">
         <nav class="variant-tree" aria-label="Variant navigation">
-          <section class="experiment-summary" aria-labelledby="experiment-name">
-            <h1 id="experiment-name" class="experiment-name">Experiment</h1>
-            <div id="experiment-meta" class="experiment-meta"></div>
+          <section class="experiment-summary" aria-labelledby="experiment-heading">
+            <div class="tree-heading"><h2 id="experiment-heading">Experiment</h2></div>
+            <button id="experiment-button" class="variant-button experiment-button" type="button" aria-current="false" aria-controls="detail">
+              <span id="experiment-name" class="experiment-name">Experiment</span>
+              <span id="experiment-meta" class="experiment-meta"></span>
+            </button>
           </section>
 
           <section aria-labelledby="current-heading">
