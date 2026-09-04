@@ -116,6 +116,10 @@ class V2Graph:
         try:
             entity_hash = self.experiment_hash(name)
         except NotFoundError:
+            if not self.bindings.can_bind_name(workspace_experiment_scope(), name):
+                raise AlreadyExistsError(
+                    f"Experiment name belongs to another active entity: {name}"
+                )
             entity = self.store.put(
                 "experiment",
                 {
@@ -198,9 +202,9 @@ class V2Graph:
         try:
             entity_hash = self.bindings.resolve(variant_scope, name)
         except NotFoundError:
-            if self.bindings.historical_target(variant_scope, name) is not None:
+            if not self.bindings.can_bind_name(variant_scope, name):
                 raise AlreadyExistsError(
-                    f"Variant name is retained in binding history: {name}"
+                    f"Variant name belongs to another active entity: {name}"
                 )
             entity = self.store.put(
                 "variant",

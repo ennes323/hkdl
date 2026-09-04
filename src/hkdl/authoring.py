@@ -600,9 +600,9 @@ def _check_experiment_creation(authoring: Authoring, name: str) -> None:
     graph = V2Graph(authoring.repository)
     if not graph.is_active():
         return
-    if graph.bindings.historical_target(workspace_experiment_scope(), name) is not None:
+    if not graph.bindings.can_bind_name(workspace_experiment_scope(), name):
         raise AlreadyExistsError(
-            f"Experiment name is retained in binding history: {name}"
+            f"Experiment name belongs to another active entity: {name}"
         )
 
 
@@ -620,8 +620,10 @@ def _check_variant_creation(
     scope = experiment_variant_scope(identity.experiment_hash)
     if name in graph.bindings.names(scope):
         raise AlreadyExistsError(f"Variant already exists: {name}")
-    if graph.bindings.historical_target(scope, name) is not None:
-        raise AlreadyExistsError(f"Variant name is retained in binding history: {name}")
+    if not graph.bindings.can_bind_name(scope, name):
+        raise AlreadyExistsError(
+            f"Variant name belongs to another active entity: {name}"
+        )
 
 
 def _creation_fingerprint(path: Path) -> tuple:

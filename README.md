@@ -19,6 +19,15 @@ This is a release-specific patch-numbering decision, not a claim that the
 release contains bug fixes only. Broader web editing is planned for the 1.3 line
 and is not included here; existing Changes commit controls remain available.
 
+Version 1.2.2 corrects two lifecycle contracts shipped in 1.2.1. A completed
+Experiment or Variant deletion now releases the deleted entity's names for a
+fresh identity, and Variant Code promotion now consumes the Source after the
+Target commit instead of requiring a second deletion. Immutable CAS, binding,
+Run, Model and OptionSet evidence remains preserved. Updating alone does not
+delete, rename, promote or migrate research state. This is a narrow,
+owner-selected patch exception for the two incorrect 1.2.1 lifecycle meanings;
+it is not a general allowance for incompatible patch changes.
+
 An Experiment may also contain optional `docs/` and `tools/` directories for
 authored documentation and utilities. HKDL excludes these two real,
 non-symlink directories from Variant discovery and shell completion and
@@ -92,18 +101,19 @@ execution policy, resource limits, and reporting preferences in an optional
 root `AGENTS.user.md`; HKDL does not distribute, track, replace, migrate, or
 delete that file.
 
-### Upgrading from 1.2.0
+### Upgrading from 1.2.1
 
-Use `hkdl update` from a clean public `main` checkout. Version 1.2.1 reinstalls
+Use `hkdl update` from a clean public `main` checkout. Version 1.2.2 reinstalls
 Core without an automatic schema migration. Existing legacy YAML, v2 YAML and
 v2 JSON workspaces retain their authored data, recorded history and immutable
-Template/Variant source. No new dependency or Template bundle version is needed.
-Keep the usual workspace backup; update is not a downgrade or recovery tool.
+Template/Variant source. No new dependency or Template bundle version is
+needed. Keep the usual workspace backup; update is not a downgrade or recovery
+tool.
 
-The direct-update verification for this candidate targets 1.2.0. Older versions
-should first follow their verified transition to 1.2.0; the previously verified
-1.1.5-to-1.2.0 path is described below. This does not claim a tested direct jump
-from 1.1.5 or 1.0.x to 1.2.1.
+The direct-update verification for this candidate targets public 1.2.1. Older
+versions should first follow their verified transitions through 1.2.0 and
+1.2.1. This does not claim a tested direct jump from 1.2.0, 1.1.5 or 1.0.x to
+1.2.2.
 
 ### Legacy upgrade: 1.1.5 to 1.2.0
 
@@ -294,8 +304,9 @@ moves its current authored root plus every output root retained under current
 or historical Experiment and Variant names to recoverable transaction trash.
 Its parent Experiment, sibling Variants, immutable CAS and derivation history,
 shared environments, and external MLflow state remain. Every owned Run must be
-terminal and lease-free, and the deleted Variant's historical names cannot be
-claimed by a different Variant entity.
+terminal and lease-free. After deletion completes, its current and historical
+names may be claimed by a new Variant entity while old evidence remains
+addressable by immutable hashes.
 
 When active child Variants exist, dry-run returns exit 5 and lists every direct
 and transitive descendant. A normal invocation strongly recommends deleting or
@@ -318,20 +329,22 @@ hkdl variant promote demo tuned --to baseline
 ```
 
 Promotion copies the Source's committed `code.json` meaning and complete `src/`
-tree into a new Target revision. The Target `options.json`, Source Variant,
-Runs, Models and per-Run OptionSets remain unchanged. Source must derive from
-Target, or continue from a Source revision previously promoted into Target, and
-Target Code must not have changed from that integration point. Dirty drafts,
-unrelated lineage, Target divergence and active Target Run or Model bindings
-return exit 5 before prompting. Source executions do not block.
+tree into a new Target revision. The Target `options.json` remains unchanged;
+the Source Variant and its active owned closure are deleted after the Target
+revision commits, while immutable Source provenance remains addressable by
+hash. Source must derive from Target and Target Code must not have changed from
+that integration point. Dirty drafts, unrelated lineage, Target divergence,
+active Target execution, nonterminal or leased Source Runs, and active Source
+descendants return exit 5 before prompting.
 
 Dry-run is read-only. A ready apply shows the exact Code delta and asks one
-`[y/N]` question; there is no `--yes` bypass. Promotion is journaled around the
-binding HEAD, so pre-HEAD failure restores the old Target and post-HEAD recovery
-completes the already-confirmed result. The Source is never deleted
-automatically; validate the promoted Target and use `variant delete` separately
-when the Source should be retired. Full three-way conflict resolution, Options
-merge, cross-Experiment promotion and Experiment merge are not supported.
+`[y/N]` question that explicitly includes Source deletion; there is no `--yes`
+bypass. Promotion and Source deletion are separately journaled around their
+binding transactions, so pre-Target-HEAD failure restores the old Target and a
+post-HEAD retry completes the already-confirmed Target publication and Source
+deletion. The deleted Source names become reusable. Full three-way conflict
+resolution, Options merge, cross-Experiment promotion and Experiment merge are
+not supported.
 
 ## Delete an Experiment
 
@@ -352,7 +365,8 @@ Experiment root and all output roots retained under its current or historical
 names to recoverable transaction trash, and removes the selected Experiment's
 active bindings in one transaction. Other Experiments, immutable CAS objects
 and blobs, binding history, shared environments, and external MLflow state are
-preserved. The deleted Experiment name remains retired and cannot be reused.
+preserved. After deletion completes, the deleted Experiment name may be claimed
+by a new entity without rewriting prior binding transactions.
 If a confirmed deletion is interrupted, repeat the same non-dry-run command;
 HKDL rolls back unpublished work or completes an already-published deletion
 before starting any new plan.

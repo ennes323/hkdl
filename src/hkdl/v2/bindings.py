@@ -143,9 +143,18 @@ class BindingLog:
         return tuple(sorted(names, key=lambda name: name.encode("utf-8")))
 
     def historical_target(self, scope: str, name: str) -> str | None:
+        """Return the most recently bound target for one scoped name."""
+
+        targets = self.historical_targets(scope, name)
+        return targets[0] if targets else None
+
+    def historical_targets(self, scope: str, name: str) -> tuple[str, ...]:
+        """Return distinct targets for one name, newest binding first."""
+
         _scope(scope)
         _name(name)
-        targets: set[str] = set()
+        targets: list[str] = []
+        observed: set[str] = set()
         current = self.head()
         seen: set[str] = set()
         while current is not None:
@@ -153,18 +162,33 @@ class BindingLog:
                 raise ContractError("v2 binding transaction chain contains a cycle")
             seen.add(current)
             payload = _validate_transaction(self.store.load(current).payload)
-            for raw in payload["operations"]:
+            for raw in reversed(payload["operations"]):
                 operation = _operation(raw)
                 if (
                     operation.action == "bind"
                     and operation.scope == scope
                     and operation.name == name
+                    and operation.target not in observed
                 ):
-                    targets.add(operation.target)
+                    observed.add(operation.target)
+                    targets.append(operation.target)
             current = payload["previous"]
-        if len(targets) > 1:
-            raise ContractError("historical name was rebound to multiple entities")
-        return next(iter(targets), None)
+        return tuple(targets)
+
+    def can_bind_name(
+        self, scope: str, name: str, *, target: str | None = None
+    ) -> bool:
+        """Whether a name is free from every other still-active entity."""
+
+        current = self.names(scope)
+        active = current.get(name)
+        if active is not None:
+            return target is not None and active == target
+        active_targets = set(current.values())
+        return not any(
+            historical != target and historical in active_targets
+            for historical in self.historical_targets(scope, name)
+        )
 
     def historical_scope_names(self, scope: str) -> tuple[str, ...]:
         """Return every name ever bound or unbound in one scope."""

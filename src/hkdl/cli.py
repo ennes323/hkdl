@@ -895,7 +895,7 @@ def _dispatch(args: argparse.Namespace) -> int:
                     "recovered": True,
                     "transaction": completed[-1]["transaction"],
                     "target_options": "preserved",
-                    "source_variant": "preserved",
+                    "source_variant": "deleted",
                 }
                 if args.output == "json":
                     _json({"promotion": payload, "dry_run": False})
@@ -929,28 +929,11 @@ def _dispatch(args: argparse.Namespace) -> int:
                 _variant_promotion_report(document, file=sys.stderr)
                 print("Nothing was changed.", file=sys.stderr)
             return 5
-        if plan.already_integrated:
-            payload = {
-                "experiment": args.experiment,
-                "source": args.source,
-                "target": args.target,
-                "changed": False,
-                "target_options": "preserved",
-                "source_variant": "preserved",
-            }
-            if args.output == "json":
-                _json({"promotion": payload, "dry_run": False})
-            else:
-                print(
-                    f"unchanged variant promotion {args.experiment}/{args.source} "
-                    f"-> {args.experiment}/{args.target}"
-                )
-            return 0
         _variant_promotion_report(document, file=sys.stderr)
         if not _confirm(
             f"Promote committed Code from {args.experiment}/{args.source} into "
             f"{args.experiment}/{args.target}? Target Options remain unchanged "
-            "and the source Variant will be preserved."
+            "and the source Variant plus its active owned closure will be deleted."
         ):
             if args.output == "json":
                 _json(
@@ -996,7 +979,8 @@ def _dispatch(args: argparse.Namespace) -> int:
             print(
                 f"promoted variant Code {args.experiment}/{args.source} -> "
                 f"{args.experiment}/{args.target} "
-                f"transaction={result_document['transaction']}"
+                f"and deleted source Variant transaction="
+                f"{result_document['transaction']}"
             )
         return 0
 
@@ -1552,7 +1536,7 @@ def _parser() -> argparse.ArgumentParser:
         help="Promote committed Source Code into an unchanged Target Variant",
         description=(
             "Plan or confirm one-sided promotion of committed schema-2 Variant "
-            "Code while preserving Target Options and the Source Variant."
+            "Code while preserving Target Options and deleting the Source Variant."
         ),
         epilog=_examples(
             "hkdl variant promote smoke tuned --to baseline --dry-run",

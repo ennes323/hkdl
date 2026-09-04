@@ -61,6 +61,13 @@ and JSON authoring are separate opt-in cutovers; review each dry-run and obtain
 approval. After cutover, do not use an older HKDL on the same workspace or treat
 retained legacy files as a complete downgrade backup.
 
+Version 1.2.2 corrects two v2 lifecycle meanings from 1.2.1. Completed
+Experiment and Variant deletion releases the deleted entity's names for a fresh
+identity. Variant Code promotion deletes the Source active closure after the
+Target commit while retaining immutable evidence. Updating does not perform
+either operation or migrate a workspace. After a reused-name binding is added,
+do not use an older HKDL Core on that workspace.
+
 ## Normal workflow
 
 Create an Experiment and Variant:
@@ -262,8 +269,18 @@ When an HKDL command may outlast the current agent turn:
 - `outputs/` contains generated Run/Model projections; `.hkdl/store/` owns v2
   objects and bindings after activation. Never edit, move, normalize, or delete
   these directly. Explicitly requested rename or deletion must use the CLI
-  after reviewing its dry-run. Deletion requires `--yes`; rename applies
-  without a further prompt when `--dry-run` is omitted.
+  after reviewing its dry-run. Experiment and Variant deletion use an
+  interactive confirmation without a `--yes` bypass; rename applies without a
+  further prompt when `--dry-run` is omitted. Completed deletion releases the
+  deleted entity's current and historical names for a fresh identity while
+  preserving immutable history.
+- Treat `hkdl variant promote EXPERIMENT SOURCE --to TARGET` as a destructive
+  one-sided Code operation, not a general merge. Inspect `--dry-run` first. It
+  preserves Target identity and Options, commits Source Code into Target, then
+  deletes the Source active closure and releases its names. Nonterminal or
+  leased Source Runs and active Source descendants block promotion. Repeat the
+  exact original non-dry-run command for journal recovery; never edit the
+  journals or delete the Source manually.
 - Never work around a contract error by modifying generated files.
 - Use `run retry` for a stopped Run; do not reuse or overwrite its Run ID.
 - Keep single-file validation, full import, and authoring conversion separate

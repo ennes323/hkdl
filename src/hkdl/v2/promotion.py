@@ -22,7 +22,13 @@ from ..storage import (
     compute_source_digest,
 )
 from .bindings import BindingHeadConflict, BindingOperation
-from .graph import CURRENT_REVISION_NAME, V2Graph, entity_revision_scope
+from .deletion import VariantDeletionPlan, VariantDeletionService
+from .graph import (
+    CURRENT_REVISION_NAME,
+    V2Graph,
+    entity_revision_scope,
+    experiment_variant_scope,
+)
 from .leases import entity_guard
 from .maintenance import PROMOTION_JOURNAL, workspace_access, workspace_operation
 from .objects import object_digest
@@ -88,6 +94,7 @@ class VariantPromotionPlan:
     template_changed: bool
     components_changed: bool
     blockers: tuple[PromotionBlocker, ...]
+    source_deletion: VariantDeletionPlan | None
     already_integrated: bool
     plan_digest: str
 
@@ -97,7 +104,7 @@ class VariantPromotionPlan:
 
     @property
     def changed(self) -> bool:
-        return self.ready and not self.already_integrated
+        return self.ready
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -119,11 +126,14 @@ class VariantPromotionPlan:
             "template_changed": self.template_changed,
             "components_changed": self.components_changed,
             "blockers": [item.as_dict() for item in self.blockers],
+            "source_deletion": (
+                None if self.source_deletion is None else self.source_deletion.as_dict()
+            ),
             "already_integrated": self.already_integrated,
             "ready": self.ready,
             "changed": self.changed,
             "target_options": "preserved",
-            "source_variant": "preserved",
+            "source_variant": "deleted",
             "plan_digest": self.plan_digest,
         }
 
@@ -153,7 +163,7 @@ class VariantPromotionResult:
             "binding_transaction": self.binding_transaction,
             "journal": None if self.journal is None else str(self.journal),
             "target_options": "preserved",
-            "source_variant": "preserved",
+            "source_variant": "deleted",
         }
 
 
@@ -266,6 +276,28 @@ class VariantPromotionService:
                 )
             )
 
+        source_deletion = None
+        if not blockers:
+            source_deletion = VariantDeletionService(self.repository).plan(
+                experiment, source
+            )
+            blockers.extend(
+                PromotionBlocker(
+                    f"SOURCE_{item.code}",
+                    f"{item.address}: {item.reason}",
+                    item.next_action,
+                )
+                for item in source_deletion.blockers
+            )
+            if source_deletion.derived_variants:
+                blockers.append(
+                    PromotionBlocker(
+                        "SOURCE_HAS_ACTIVE_DESCENDANTS",
+                        "Source Variant has active derived Variants",
+                        "delete or reorganize Source descendants before promotion",
+                    )
+                )
+
         comparison = target_payload if base_payload is None else base_payload
         provisional = VariantPromotionPlan(
             experiment=experiment,
@@ -289,6 +321,7 @@ class VariantPromotionService:
                 comparison.get("components") != source_payload.get("components")
             ),
             blockers=tuple(blockers),
+            source_deletion=source_deletion,
             already_integrated=already_integrated,
             plan_digest="",
         )
@@ -314,16 +347,6 @@ class VariantPromotionService:
                         + "; ".join(item.reason for item in current.blockers),
                         current,
                     )
-                if current.already_integrated:
-                    return VariantPromotionResult(
-                        current.experiment,
-                        current.source,
-                        current.target,
-                        False,
-                        None,
-                        None,
-                        None,
-                    )
                 return self._execute(current)
 
     def recover(
@@ -345,17 +368,24 @@ class VariantPromotionService:
                     "pending Variant promotion belongs to "
                     f"{pending}; repeat that original command"
                 )
+            VariantDeletionService(self.repository).recover()
             current_head = self.graph.bindings.head()
             committed = document.get("binding_transaction")
-            if committed is None and self._head_matches(current_head, document):
-                committed = current_head
-                document["binding_transaction"] = current_head
-            if committed is not None and current_head == committed:
-                if self.graph.bindings.head() != committed:
-                    raise PromotionConflict(
-                        "binding HEAD changed during Variant promotion recovery"
-                    )
+            if committed is None:
+                committed = self._matching_transaction(current_head, document)
+                if committed is not None:
+                    document["binding_transaction"] = committed
+            if committed is not None and self._head_descends_from(
+                current_head, str(committed)
+            ):
                 self._finish_committed(document)
+                if not self._source_deleted(document):
+                    self._delete_source_identity(
+                        str(document["experiment"]),
+                        str(document["source"]),
+                        str(document["source_variant_hash"]),
+                    )
+                self._complete(document)
                 action = "completed"
             elif current_head == document["before_head"]:
                 if self.graph.bindings.head() != document["before_head"]:
@@ -391,16 +421,21 @@ class VariantPromotionService:
         source_payload = self._revision(
             plan.source_revision_hash, owner=plan.source_variant_hash
         )
-        new_payload = {
-            "variant": plan.target_variant_hash,
-            "parent": plan.target_revision_hash,
-            "derivation_parent": None,
-            "merge_parent": plan.source_revision_hash,
-            "template": source_payload["template"],
-            "source_tree": source_payload["source_tree"],
-            "components": source_payload["components"],
-        }
-        new_revision = self.graph.store.put("variant_revision", new_payload)
+        if plan.already_integrated:
+            new_revision_hash = plan.target_revision_hash
+        else:
+            new_payload = {
+                "variant": plan.target_variant_hash,
+                "parent": plan.target_revision_hash,
+                "derivation_parent": None,
+                "merge_parent": plan.source_revision_hash,
+                "template": source_payload["template"],
+                "source_tree": source_payload["source_tree"],
+                "components": source_payload["components"],
+            }
+            new_revision_hash = self.graph.store.put(
+                "variant_revision", new_payload
+            ).digest
         operations = [
             BindingOperation(
                 "unbind",
@@ -412,7 +447,7 @@ class VariantPromotionService:
                 "bind",
                 entity_revision_scope(plan.target_variant_hash),
                 CURRENT_REVISION_NAME,
-                new_revision.digest,
+                new_revision_hash,
             ),
         ]
         document: dict[str, Any] = {
@@ -426,7 +461,7 @@ class VariantPromotionService:
             "target_variant_hash": plan.target_variant_hash,
             "source_revision_hash": plan.source_revision_hash,
             "target_revision_hash": plan.target_revision_hash,
-            "new_revision_hash": new_revision.digest,
+            "new_revision_hash": new_revision_hash,
             "before_head": plan.before_head,
             "binding_transaction": None,
             "plan_digest": plan.plan_digest,
@@ -473,15 +508,18 @@ class VariantPromotionService:
             os.rename(candidate, target_path)
             self._fsync(target_path.parent)
             self._write_journal(document, phase="target_published")
-            promoted = self.authoring.load_variant(plan.experiment, plan.target)
-            identity = self.graph.preview_variant_revision(
-                plan.target_variant_hash,
-                promoted,
-                parent=plan.target_revision_hash,
-                merge_parent=plan.source_revision_hash,
-            )
-            if identity.variant_revision_hash != new_revision.digest:
-                raise ContractError("promoted draft disagrees with planned revision")
+            if not plan.already_integrated:
+                promoted = self.authoring.load_variant(plan.experiment, plan.target)
+                identity = self.graph.preview_variant_revision(
+                    plan.target_variant_hash,
+                    promoted,
+                    parent=plan.target_revision_hash,
+                    merge_parent=plan.source_revision_hash,
+                )
+                if identity.variant_revision_hash != new_revision_hash:
+                    raise ContractError(
+                        "promoted draft disagrees with planned revision"
+                    )
             try:
                 binding_transaction = self.graph.bindings.commit(
                     operations, expected_head=plan.before_head
@@ -493,9 +531,8 @@ class VariantPromotionService:
             document["binding_transaction"] = binding_transaction
             self._write_journal(document, phase="binding_committed")
             GraphProjection(self.graph).rebuild()
-            self._write_journal(document, phase="completed")
-            self.stable_journal.unlink()
-            self._fsync(self.stable_journal.parent)
+            self._delete_source(plan)
+            self._complete(document)
             return VariantPromotionResult(
                 plan.experiment,
                 plan.source,
@@ -522,7 +559,13 @@ class VariantPromotionService:
             if rolled_back:
                 state = "rolled back successfully"
                 recovery_journal = transaction_dir / "journal.json"
-            elif self._head_matches(self.graph.bindings.head(), document):
+            elif (
+                document.get("binding_transaction") is not None
+                and self._head_descends_from(
+                    self.graph.bindings.head(),
+                    str(document["binding_transaction"]),
+                )
+            ) or self._matching_transaction(self.graph.bindings.head(), document):
                 state = "promotion committed; recovery required"
                 recovery_journal = self.stable_journal
             else:
@@ -533,6 +576,33 @@ class VariantPromotionService:
                 state=state,
                 journal=recovery_journal,
             ) from error
+
+    def _delete_source(self, plan: VariantPromotionPlan):
+        if plan.source_deletion is None:
+            raise ContractError("Variant promotion Source deletion plan is unavailable")
+        return self._delete_source_identity(
+            plan.experiment, plan.source, plan.source_variant_hash
+        )
+
+    def _delete_source_identity(
+        self, experiment: str, source: str, source_variant_hash: str
+    ):
+        deletion = VariantDeletionService(self.repository)
+        current = deletion.plan(experiment, source)
+        if current.variant_hash != source_variant_hash:
+            raise PromotionConflict(
+                "Source Variant identity changed before promotion deletion"
+            )
+        if not current.ready:
+            raise PromotionConflict(
+                "Source Variant deletion is blocked: "
+                + "; ".join(item.reason for item in current.blockers)
+            )
+        if current.derived_variants:
+            raise PromotionConflict(
+                "Source Variant gained active descendants before promotion deletion"
+            )
+        return deletion.execute(current)
 
     def _integration_base(
         self,
@@ -837,17 +907,27 @@ class VariantPromotionService:
         target_variant = str(document["target_variant_hash"])
         if source_variant == target_variant:
             raise ContractError("Variant promotion journal owners are invalid")
-        self._revision(str(document["source_revision_hash"]), owner=source_variant)
-        self._revision(str(document["target_revision_hash"]), owner=target_variant)
-        promoted = self._revision(
-            str(document["new_revision_hash"]), owner=target_variant
+        source_revision = self._revision(
+            str(document["source_revision_hash"]), owner=source_variant
         )
-        if (
-            promoted.get("parent") != document["target_revision_hash"]
-            or promoted.get("merge_parent") != document["source_revision_hash"]
-            or promoted.get("derivation_parent") is not None
-        ):
-            raise ContractError("Variant promotion journal revision is invalid")
+        target_revision = self._revision(
+            str(document["target_revision_hash"]), owner=target_variant
+        )
+        if document["new_revision_hash"] == document["target_revision_hash"]:
+            if self._code_identity(source_revision) != self._code_identity(
+                target_revision
+            ):
+                raise ContractError("Variant promotion journal no-op is invalid")
+        else:
+            promoted = self._revision(
+                str(document["new_revision_hash"]), owner=target_variant
+            )
+            if (
+                promoted.get("parent") != document["target_revision_hash"]
+                or promoted.get("merge_parent") != document["source_revision_hash"]
+                or promoted.get("derivation_parent") is not None
+            ):
+                raise ContractError("Variant promotion journal revision is invalid")
         self._ensure_trash_root()
         transaction_dir = self.trash_root / str(document["transaction"])
         if transaction_dir.is_symlink() or not transaction_dir.is_dir():
@@ -920,23 +1000,79 @@ class VariantPromotionService:
         current = self.graph.current_revision(str(document["target_variant_hash"]))
         if current != document["new_revision_hash"]:
             raise ContractError("committed Variant promotion revision is not current")
-        promoted = self.authoring.load_variant(
-            str(document["experiment"]), str(document["target"])
-        )
-        identity = self.graph.preview_variant_revision(
-            str(document["target_variant_hash"]),
-            promoted,
-            parent=str(document["target_revision_hash"]),
-            merge_parent=str(document["source_revision_hash"]),
-        )
-        if identity.variant_revision_hash != document["new_revision_hash"]:
-            raise ContractError(
-                "committed Variant promotion draft disagrees with its revision"
+        if document["new_revision_hash"] != document["target_revision_hash"]:
+            promoted = self.authoring.load_variant(
+                str(document["experiment"]), str(document["target"])
             )
+            identity = self.graph.preview_variant_revision(
+                str(document["target_variant_hash"]),
+                promoted,
+                parent=str(document["target_revision_hash"]),
+                merge_parent=str(document["source_revision_hash"]),
+            )
+            if identity.variant_revision_hash != document["new_revision_hash"]:
+                raise ContractError(
+                    "committed Variant promotion draft disagrees with its revision"
+                )
         GraphProjection(self.graph).rebuild()
+
+    def _complete(self, document: dict[str, Any]) -> None:
         self._write_journal(document, phase="completed")
         self.stable_journal.unlink()
         self._fsync(self.stable_journal.parent)
+
+    def _source_deleted(self, document: dict[str, Any]) -> bool:
+        experiment_hash = self.graph.experiment_hash(str(document["experiment"]))
+        scope = experiment_variant_scope(experiment_hash)
+        source = str(document["source"])
+        expected = str(document["source_variant_hash"])
+        try:
+            active = self.graph.bindings.resolve(scope, source)
+        except NotFoundError:
+            if expected not in self.graph.bindings.historical_targets(scope, source):
+                raise PromotionConflict(
+                    "Variant promotion Source history is unavailable"
+                )
+            return True
+        if active != expected:
+            raise PromotionConflict(
+                "Variant promotion Source name belongs to a different entity"
+            )
+        return False
+
+    def _matching_transaction(
+        self, head: str | None, document: dict[str, Any]
+    ) -> str | None:
+        current = head
+        seen: set[str] = set()
+        while current is not None:
+            if current in seen:
+                raise ContractError("v2 binding transaction chain contains a cycle")
+            seen.add(current)
+            if self._head_matches(current, document):
+                return current
+            record = self.graph.store.load(current)
+            if record.kind != "binding_transaction":
+                raise ContractError("v2 binding chain contains a non-transaction")
+            previous = record.payload.get("previous")
+            current = None if previous is None else str(previous)
+        return None
+
+    def _head_descends_from(self, head: str | None, ancestor: str) -> bool:
+        current = head
+        seen: set[str] = set()
+        while current is not None:
+            if current == ancestor:
+                return True
+            if current in seen:
+                raise ContractError("v2 binding transaction chain contains a cycle")
+            seen.add(current)
+            record = self.graph.store.load(current)
+            if record.kind != "binding_transaction":
+                raise ContractError("v2 binding chain contains a non-transaction")
+            previous = record.payload.get("previous")
+            current = None if previous is None else str(previous)
+        return False
 
     def _head_matches(self, head: str | None, document: dict[str, Any]) -> bool:
         if head is None:

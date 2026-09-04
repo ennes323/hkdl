@@ -127,6 +127,12 @@ class V2Authoring:
         experiment_hash = self.graph.bindings.resolve(scope, old_name)
         if new_name in self.graph.bindings.names(scope):
             raise AlreadyExistsError(f"Experiment already exists: {new_name}")
+        if not self.graph.bindings.can_bind_name(
+            scope, new_name, target=experiment_hash
+        ):
+            raise AlreadyExistsError(
+                f"Experiment name belongs to another active entity: {new_name}"
+            )
         target = self.authoring.repository.experiments / new_name
         if os.path.lexists(target):
             raise AlreadyExistsError(f"Experiment draft already exists: {new_name}")
@@ -199,10 +205,9 @@ class V2Authoring:
         variant_hash = self.graph.bindings.resolve(scope, old_name)
         if new_name in self.graph.bindings.names(scope):
             raise AlreadyExistsError(f"Variant already exists: {experiment}/{new_name}")
-        historical_target = self.graph.bindings.historical_target(scope, new_name)
-        if historical_target is not None and historical_target != variant_hash:
+        if not self.graph.bindings.can_bind_name(scope, new_name, target=variant_hash):
             raise AlreadyExistsError(
-                f"Variant name is retained in binding history: {new_name}"
+                f"Variant name belongs to another active entity: {new_name}"
             )
         target = experiment_record.path / new_name
         if os.path.lexists(target):
