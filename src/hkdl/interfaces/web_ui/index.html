@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>HKDL</title>
+    <link rel="icon" href="/assets/favicon.svg" type="image/svg+xml">
+    <link rel="stylesheet" href="/assets/app.css">
+    <script src="/assets/metric-chart.js" defer></script>
+    <script src="/assets/app.js" defer></script>
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <div class="brand-row">
+          <span class="brand">HKDL</span>
+          <span class="mode">LOCAL WORKSPACE</span>
+          <span id="experiment-context" class="experiment-context">Loading…</span>
+        </div>
+        <div class="observe-row">
+          <nav class="view-switch" aria-label="Primary view">
+            <button id="overview-view" class="view-button" type="button" aria-pressed="true">
+              Overview
+            </button>
+            <button id="compare-view" class="view-button" type="button" aria-pressed="false">
+              Compare
+            </button>
+            <button id="changes-view" class="view-button" type="button" aria-pressed="false">
+              Changes
+            </button>
+          </nav>
+          <div class="observation-actions">
+            <span id="observed-at" class="observed-at" aria-live="polite"></span>
+            <button id="refresh" class="refresh" type="button">Refresh</button>
+          </div>
+        </div>
+      </header>
+
+      <div id="error" class="error" role="alert" hidden></div>
+
+      <div class="workspace">
+        <nav class="variant-tree" aria-label="Variant navigation">
+          <section class="experiment-summary" aria-labelledby="experiment-heading">
+            <div class="tree-heading"><h2 id="experiment-heading">Experiment</h2></div>
+            <button id="experiment-button" class="variant-button experiment-button" type="button" aria-current="false" aria-controls="detail">
+              <span id="experiment-name" class="experiment-name">Experiment</span>
+              <span id="experiment-meta" class="experiment-meta"></span>
+            </button>
+          </section>
+
+          <section aria-labelledby="current-heading">
+            <div class="tree-heading">
+              <h2 id="current-heading">Current Variants</h2>
+              <span id="current-count" class="tree-count">0</span>
+            </div>
+            <div id="current-variants" class="variant-list"></div>
+          </section>
+
+          <section class="history-section">
+            <button
+              id="history-toggle"
+              class="history-toggle"
+              type="button"
+              aria-expanded="false"
+              aria-controls="historical-variants"
+            >
+              <span><span class="disclosure" aria-hidden="true">›</span> Historical only</span>
+              <span id="history-count" class="tree-count">0</span>
+            </button>
+            <div id="historical-variants" class="variant-list" hidden></div>
+          </section>
+        </nav>
+
+        <main id="detail" class="detail" aria-live="polite">
+          <div class="loading">Loading Experiment state…</div>
+        </main>
+      </div>
+    </div>
+    <noscript>This read-only view requires JavaScript.</noscript>
+  </body>
+</html>

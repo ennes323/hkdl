@@ -1,0 +1,56 @@
+{
+  "schema_version": 2,
+  "dataset": {
+    "kind": "bundled_imagefolder",
+    "train_dir": "data/train",
+    "eval_dir": "data/eval",
+    "image_size": [3, 64, 64],
+    "classes": ["daisy", "sunflowers"]
+  },
+  "metrics": {
+    "primary": "accuracy",
+    "report": ["accuracy"]
+  },
+  "train": {
+    "steps": 4,
+    "batch_size": 8,
+    "learning_rate": 0.01
+  },
+  "eval": {
+    "cases": {
+      "default": {
+        "dataset": {
+          "split": "eval"
+        },
+        "selector": {},
+        "metrics": {
+          "primary": "accuracy",
+          "report": ["accuracy"]
+        },
+        "steps": 2,
+        "batch_size": 8
+      },
+      "daisy-only": {
+        "dataset": {
+          "split": "eval"
+        },
+        "selector": {
+          "class": "daisy"
+        },
+        "metrics": {
+          "primary": "accuracy",
+          "report": ["accuracy"]
+        },
+        "steps": 1,
+        "batch_size": 8
+      }
+    }
+  },
+  "infer": {
+    "format": "onnx",
+    "opset_version": 18,
+    "input_shape": [1, 3, 64, 64],
+    "input_name": "input",
+    "output_name": "logits"
+  }
+}

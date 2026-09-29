@@ -1,6 +1,6 @@
 [project]
 name = "hkdl"
-version = "1.2.2"
+version = "2.0.0"
 description = "Local experiment management control plane"
 license = "MIT"
 requires-python = ">=3.12,<3.13"
@@ -11,11 +11,16 @@ dependencies = [
 ]
 
 [project.scripts]
-hkdl = "hkdl.cli:main"
+hkdl = "hkdl.interfaces.cli:main"
 
 [build-system]
 requires = ["uv_build>=0.9.27,<0.10"]
 build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = ["hkdl", "templates"]
+namespace = true
+source-exclude = [".venv"]
 
 [dependency-groups]
 dev = [

@@ -8,8 +8,10 @@ import sys
 import tomllib
 from pathlib import Path
 
-from .config import ContractError, VERSION_PATTERN
-from .storage import RepositoryPaths, parse_version
+from hkdl.authoring.config import VERSION_PATTERN
+from hkdl.storage.storage import RepositoryPaths, parse_version
+
+from .errors import ContractError
 
 
 class UpdateConflict(RuntimeError):
@@ -20,7 +22,19 @@ class UpdateFailure(RuntimeError):
     """Git or environment setup failed."""
 
 
+# Flow: validate the checkout, fetch and check the target, confirm, then
+# fast-forward and reinstall. An unchanged checkout may only need reinstallation.
 def update(repository: RepositoryPaths, *, assume_yes: bool = False) -> None:
+    """Update a clean public main checkout or repair its installed environment.
+
+    Reject divergent or incompatible releases before changing source. If setup
+    fails after fast-forwarding, keep the updated source for a setup retry.
+    """
+    if repository.standalone:
+        raise ContractError(
+            "source update is unavailable in an independent workspace; "
+            "use the managed hkdl launcher and select a release bundle"
+        )
     root = repository.root
     _require_public_checkout(root)
     branch_result = _git(root, "symbolic-ref", "--quiet", "--short", "HEAD")
@@ -41,11 +55,12 @@ def update(repository: RepositoryPaths, *, assume_yes: bool = False) -> None:
         raise UpdateFailure("could not fetch origin/main")
 
     target = _git_output(root, "rev-parse", "--verify", "FETCH_HEAD")
-    _require_public_target(root)
+    # FETCH_HEAD can change in another terminal; validate the commit we will merge.
+    _require_public_target(root, target)
     target_version = _project_version(
-        _git_output(root, "show", "FETCH_HEAD:pyproject.toml")
+        _git_output(root, "show", f"{target}:pyproject.toml")
     )
-    ancestry = _git(root, "merge-base", "--is-ancestor", "HEAD", "FETCH_HEAD")
+    ancestry = _git(root, "merge-base", "--is-ancestor", head, target)
     if ancestry.returncode == 1:
         raise UpdateConflict("main has diverged from origin/main")
     if ancestry.returncode:
@@ -63,6 +78,7 @@ def update(repository: RepositoryPaths, *, assume_yes: bool = False) -> None:
         if not _confirm("Reinstall from the current source?", assume_yes):
             print("Update cancelled. The checkout was not changed.")
             return
+        _require_reviewed_checkout(root, branch=branch, head=head)
         print("Reinstalling HKDL...", file=sys.stderr)
         _run_setup(root, source_updated=False, version=source_version)
         print(
@@ -97,9 +113,7 @@ def update(repository: RepositoryPaths, *, assume_yes: bool = False) -> None:
         print("Update cancelled. The checkout was not changed.")
         return
 
-    _require_clean(root)
-    if _git_output(root, "rev-parse", "--verify", "HEAD") != head:
-        raise UpdateConflict("main changed while update confirmation was pending")
+    _require_reviewed_checkout(root, branch=branch, head=head)
 
     print("Updating source...", file=sys.stderr)
     merged = _git(root, "merge", "--ff-only", "--quiet", target)
@@ -117,16 +131,29 @@ def update(repository: RepositoryPaths, *, assume_yes: bool = False) -> None:
 
 
 def _require_public_checkout(root: Path) -> None:
+    """Require the Git root and tracked files of a public HKDL source checkout.
+
+    Raise ContractError for a non-root path, the internal release manifest,
+    missing setup metadata, or tracked user-owned AGENTS.user.md. This checks
+    checkout layout; branch, remote, and cleanliness are checked by the caller.
+    """
     top = _git(root, "rev-parse", "--show-toplevel")
     if top.returncode or Path(top.stdout.strip()).resolve() != root:
         raise ContractError("hkdl update requires a public Git checkout root")
+    if (
+        _git(
+            root, "ls-files", "--error-unmatch", "public-release-manifest.txt"
+        ).returncode
+        == 0
+    ):
+        raise ContractError("hkdl update requires a public HKDL source checkout")
     public_files = _git(
         root,
         "ls-files",
         "--error-unmatch",
         "setup.sh",
-        "AGENTS.md",
-        "CLAUDE.md",
+        "pyproject.toml",
+        "uv.lock",
     )
     if public_files.returncode:
         raise ContractError("hkdl update requires a public HKDL source checkout")
@@ -134,21 +161,23 @@ def _require_public_checkout(root: Path) -> None:
         raise ContractError("public HKDL must not track user-owned AGENTS.user.md")
 
 
-def _require_public_target(root: Path) -> None:
-    if not _git(root, "cat-file", "-e", "FETCH_HEAD:AGENTS.user.md").returncode:
+def _require_public_target(root: Path, target: str) -> None:
+    if not _git(
+        root, "cat-file", "-e", f"{target}:public-release-manifest.txt"
+    ).returncode:
+        raise ContractError("origin/main is not a public HKDL release")
+    if not _git(root, "cat-file", "-e", f"{target}:AGENTS.user.md").returncode:
         raise ContractError("origin/main must not track user-owned AGENTS.user.md")
     for path in (
         "setup.sh",
-        "AGENTS.md",
-        "CLAUDE.md",
         "pyproject.toml",
         "uv.lock",
         "src/hkdl",
         "src/templates",
     ):
-        if _git(root, "cat-file", "-e", f"FETCH_HEAD:{path}").returncode:
+        if _git(root, "cat-file", "-e", f"{target}:{path}").returncode:
             raise ContractError("origin/main is not a public HKDL release")
-    setup = _git_output(root, "ls-tree", "FETCH_HEAD", "--", "setup.sh").split()
+    setup = _git_output(root, "ls-tree", target, "--", "setup.sh").split()
     if not setup or setup[0] != "100755":
         raise ContractError("origin/main setup.sh is not executable")
 
@@ -159,6 +188,19 @@ def _require_clean(root: Path) -> None:
         raise UpdateFailure("could not inspect the Git checkout")
     if status.stdout:
         raise UpdateConflict("public checkout has local changes")
+
+
+def _require_reviewed_checkout(root: Path, *, branch: str, head: str) -> None:
+    """Recheck the approved source before either fast-forward or setup repair.
+
+    A branch switch can preserve HEAD, so commit equality alone is insufficient.
+    """
+    _require_clean(root)
+    current_branch = _git(root, "symbolic-ref", "--quiet", "--short", "HEAD")
+    if current_branch.returncode or current_branch.stdout.strip() != branch:
+        raise UpdateConflict("checkout branch changed while confirmation was pending")
+    if _git_output(root, "rev-parse", "--verify", "HEAD") != head:
+        raise UpdateConflict("main changed while update confirmation was pending")
 
 
 def _show_update(

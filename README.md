@@ -1,498 +1,138 @@
 # HKDL
 
-HKDL authors self-contained ML Variants and records immutable execution
-history. The 1.2 release line separates user-authored research JSON from mechanically
-managed identities, revisions, Run attempts, Models and results. It adds the v2
-content-addressed store, explicit legacy migration, Code/Options snapshots,
-safe rename/deletion, and a local Experiment web view with comparisons,
-learning curves, Run inspection and explicit Changes commits. Multi-seed
-training, named evaluation cases, Variant-owned export, checkpoint retry,
-local logs/metrics, shared locked environments and opt-in MLflow remain supported.
+HKDL is a local tool for managing machine learning experiments and preserving their execution history. It captures the code and configuration used by each run, records its results, and keeps previous runs intact as experiments evolve.
 
-Version 1.2.1 completes the scope originally intended for 1.2.0, whose JSON
-authoring release was prioritized. It includes the refined Experiment/Variant
-web layout and multiple metric charts with shared Run selection, explicit loss
-overlay, and quieter refresh feedback. It also adds recoverable whole-Experiment
-and whole-Variant deletion and one-sided committed Variant Code promotion.
-These are explicit CLI operations; updating does not run them automatically.
-This is a release-specific patch-numbering decision, not a claim that the
-release contains bug fixes only. Broader web editing is planned for the 1.3 line
-and is not included here; existing Changes commit controls remain available.
+HKDL also supports working with LLM-based coding agents. `hkdl workspace init` provides an `AGENTS.md` guide at the research root for operating experiments while preserving research data and execution history.
 
-Version 1.2.2 corrects two lifecycle contracts shipped in 1.2.1. A completed
-Experiment or Variant deletion now releases the deleted entity's names for a
-fresh identity, and Variant Code promotion now consumes the Source after the
-Target commit instead of requiring a second deletion. Immutable CAS, binding,
-Run, Model and OptionSet evidence remains preserved. Updating alone does not
-delete, rename, promote or migrate research state. This is a narrow,
-owner-selected patch exception for the two incorrect 1.2.1 lifecycle meanings;
-it is not a general allowance for incompatible patch changes.
+## Install
 
-An Experiment may also contain optional `docs/` and `tools/` directories for
-authored documentation and utilities. HKDL excludes these two real,
-non-symlink directories from Variant discovery and shell completion and
-reserves both names from Variant creation. Every other visible Experiment
-directory remains a Variant catalog entry and is validated as such. An
-existing Variant named `docs` or `tools` must be renamed before updating;
-HKDL does not migrate it automatically.
+Install [uv](https://docs.astral.sh/uv/getting-started/installation/), then use the standalone installer and release bundle supplied together:
 
-For optional research-decision history, copy the
-[Experiment Decision Record starter](docs/examples/experiment-decision-record.yaml)
-into `experiments/<experiment>/docs/records/<RECORD-ID>.yaml` and follow the
-[authoring guidance](docs/experiment-decision-records.md). These notes are not
-discovered, validated, updated, or required by HKDL and do not affect execution
-or cleanup behavior.
+```sh
+uv run --no-project --python 3.12 INSTALLER.pyz install BUNDLE.zip
+```
 
-## Setup
+Replace the filenames with the installer and bundle supplied together on the selected [GitHub Release](https://github.com/hukuhaka/hkdl/releases). Check the attached checksum file before installation; a package version alone does not establish artifact availability.
 
-From the cloned repository root:
+The installer previews the bundle and asks before activation. Add the printed launcher directory to `PATH`; it defaults to `~/.local/bin`. Python 3.12 and locked dependencies may be downloaded by uv.
 
-```text
+Create a separate research workspace:
+
+```sh
+hkdl workspace init /path/to/research
+cd /path/to/research
+```
+
+HKDL and its execution environment live outside this directory. The workspace holds your experiments, results, and local agent guidance; it does not need a source checkout or root virtual environment.
+
+Source-checkout installation remains available:
+
+```sh
+git clone https://github.com/hukuhaka/hkdl.git
+cd hkdl
 ./setup.sh
 source ./activate.sh
-hkdl --version
-hkdl --help
 ```
 
-`setup.sh` is the maintained environment entrypoint. It creates the root
-`.venv` as a relocatable environment when needed, normalizes an existing root
-environment after a checkout move, and recreates only a recognized incomplete
-virtual environment. It then performs a locked, non-editable full reinstall
-and verifies the installed CLI. A symlink, file, or non-venv directory at
-`.venv` is rejected without deletion. Setup changes only the generated root
-environment; authored Experiments, Variant source, Runs, Models, outputs, and
-other generated state are preserved. `activate.sh` activates that root
-environment and registers completion in the current Bash or Zsh session.
+## Run your first experiment
 
-## Shell completion
+Create an Experiment from the ResNet18 image-classification Template, then create a Variant:
 
-The recommended `source ./activate.sh` flow registers completion automatically.
-To register it manually after activating the environment, run only the line for
-your shell:
-
-```text
-eval "$(hkdl completion zsh)"
-eval "$(hkdl completion bash)"
-```
-
-HKDL completes commands, options, Templates, Experiments, Variants, Runs,
-Models, Training Groups, Evaluation Cases, seeds, and devices from the current
-repository. Static command and option completion also works outside a
-repository. Neither setup nor activation modifies shell startup files or
-installs completion globally; source `activate.sh` once in each new shell.
-
-## Update
-
-From a public source checkout root:
-
-```text
-hkdl update
-```
-
-The command shows the installed and available versions, lists what will change
-and what will be preserved, and asks before updating. It fast-forwards the
-public source and reinstalls HKDL. Experiments, outputs, existing Variants, and
-authored schemas are not changed. The optional ignored `AGENTS.user.md` is
-user-owned and is also preserved. Use `hkdl update --yes` only when confirmation
-has already been provided.
-
-The public `AGENTS.md` contains HKDL-managed coding-agent defaults. Put local
-execution policy, resource limits, and reporting preferences in an optional
-root `AGENTS.user.md`; HKDL does not distribute, track, replace, migrate, or
-delete that file.
-
-### Upgrading from 1.2.1
-
-Use `hkdl update` from a clean public `main` checkout. Version 1.2.2 reinstalls
-Core without an automatic schema migration. Existing legacy YAML, v2 YAML and
-v2 JSON workspaces retain their authored data, recorded history and immutable
-Template/Variant source. No new dependency or Template bundle version is
-needed. Keep the usual workspace backup; update is not a downgrade or recovery
-tool.
-
-The direct-update verification for this candidate targets public 1.2.1. Older
-versions should first follow their verified transitions through 1.2.0 and
-1.2.1. This does not claim a tested direct jump from 1.2.0, 1.1.5 or 1.0.x to
-1.2.2.
-
-### Legacy upgrade: 1.1.5 to 1.2.0
-
-Use `hkdl update` from a public `main` checkout with an `origin` remote and no
-tracked local changes. It asks for consent, fast-forwards source and reinstalls
-the environment. It does not convert research data. Keep a complete workspace
-backup before any separately approved migration, and finish active Runs first.
-
-- Existing YAML workspaces continue using their legacy format and execution
-  history after the source update. Existing Variant source and immutable
-  Template `1.0.x` bytes are unchanged.
-- For v2 management, review `hkdl migrate --all --dry-run -o json` first.
-  Only after approving its readiness, space requirements and changes, run
-  `hkdl migrate --all` and confirm the cutover. Legacy files remain preserved.
-- For JSON authoring, separately review
-  `hkdl migrate --authoring --dry-run -o json` in the active v2 workspace.
-  Apply only the approved plan with `--authoring --yes` and optionally
-  `--expect-plan sha256:<reviewed-digest>`. See [Schema compatibility](#schema-compatibility)
-  for tracker conflicts and recovery. Never change either marker by hand.
-
-New empty workspaces using the bundled JSON Templates initialize v2 during the
-first `experiment create`; no migration command is needed. While an interrupted
-initialization is pending, ordinary operations are blocked: repeat the exact original
-`experiment create` command to resume validation/publication. Changed or
-unexpected files are preserved and stop recovery instead of being overwritten.
-If creation already completed, the normal existing-name error on a repeated
-create is expected; inspect or commit that Experiment rather than recreating it.
-
-After a v2 cutover, do not run an older HKDL against that workspace. Preserved
-legacy files alone are not a downgrade mechanism; use a separate complete
-pre-migration backup if returning to the earlier release is necessary.
-
-## End-to-end example
-
-Create an Experiment and copy the latest Template into a Variant:
-
-```text
+```sh
 hkdl experiment create demo --template resnet18
 hkdl variant create demo baseline
 ```
 
-Train two seeds in one Training Group:
+Train on CPU:
 
-```text
-hkdl run train demo baseline stability --seed 0,1
+```sh
+hkdl run train demo baseline smoke --seed 0 -d cpu
+```
+
+The Template includes a small image dataset and trains without downloading additional data or pretrained weights.
+
+Evaluate the trained Model:
+
+```sh
+hkdl run eval demo baseline smoke default --seed 0
 hkdl model list demo baseline
 ```
 
-Evaluate all Models with a named Evaluation Case:
+Inspect the training log and metrics:
 
-```text
-hkdl run eval demo baseline stability default --seed all
-hkdl run eval demo baseline stability daisy-only --seed 0
-```
-
-Export one exact Model:
-
-```text
-hkdl run export demo baseline model-0123456789abcdef0123456789abcdef
-```
-
-Inspect the reconstructed hierarchy:
-
-```text
-hkdl status demo baseline
-hkdl status demo baseline --full
-hkdl status demo --table
-hkdl status demo baseline --output json
-```
-
-`--table` compares aggregate Eval results across Variants and Training Groups,
-with one row per Evaluation Case and metric. It is a text-only alternative to
-the brief and full hierarchy views.
-
-Before v2 activation, range status queries may maintain
-`outputs/.hkdl-index.sqlite3` as a disposable projection of authoritative
-authored and generated files. With `.hkdl/store/CURRENT` set to `v2`, the
-separate projection is `.hkdl/store/v2/index.sqlite3`, rebuilt from immutable
-objects and bindings. Neither database is authority. V2 inspection reads the
-graph directly; captured terminal records, metrics, and logs do not require
-generated output files. Older Attempts without captured evidence retain a
-compatibility reader, and active logs/metrics still use working files. Keep
-legacy outputs unless their cleanup is separately approved; activation alone
-is not permission to remove them.
-
-```text
-hkdl index status
-hkdl index rebuild
-```
-
-`index status` inspects projection health without writing. `index rebuild`
-validates current authority, builds a sibling candidate database, and
-atomically replaces only the projection. Neither command migrates or rewrites
-authored or generated records.
-
-Inspect and commit one Experiment through its local web view:
-
-```text
-hkdl web demo
-hkdl web demo --port 8765
-```
-
-The foreground server binds only to `127.0.0.1`, prints its local URL, and
-stops on interrupt. The selected Experiment is fixed for the server lifetime;
-there is no global Experiment picker. Current authored Variants and preserved
-generated-history-only Variant identities remain visibly separate, and active
-persisted Run states do not claim process liveness. In active v2 workspaces,
-the Changes view can commit
-validated Experiment or Variant Code revisions; Options remain next-Run inputs.
-Open **View Run** to inspect captured Code/Options, one Run's learning curve,
-recorded stop reason and recent worker log. These are historical inputs, not
-the current draft; refresh remains manual and missing data is shown explicitly.
-
-The web view does not edit JSON, launch, retry, cancel, rename, delete,
-authenticate, or poll automatically.
-
-Inspect repository-owned local storage without changing it:
-
-```text
-hkdl storage
-hkdl storage --output json
-```
-
-The report separates authored Experiment content, Variant environments, and
-outputs. Disposable status-index files and sidecars are excluded. Environment
-bytes count legacy per-Variant `.venv` directories plus
-the repository-local shared store once. Sizes are logical file bytes; symlinks
-are not followed. The command does not delete or prune anything.
-
-Variant actions reuse an immutable environment when their lock files, optional
-extras, exact Python runtime, platform, and `uv` version match. HKDL keeps the
-shared store under `.hkdl/environments/`; existing per-Variant `.venv`
-directories remain untouched until an explicit prune.
-
-Preview or confirm safe cleanup with:
-
-```text
-hkdl environment prune --dry-run
-hkdl environment prune
-hkdl environment prune --yes
-```
-
-The default prune removes legacy Variant environments, incomplete cache
-entries, and shared environments no longer referenced by an authored Variant.
-`hkdl environment prune --all` also selects referenced but inactive shared
-environments. Environments with an active execution lease are always skipped.
-
-Each train, evaluation, or export command above creates one immutable action
-Run. A successful Train Run also creates an immutable Model. Evaluation and
-export target Models; they do not advance a shared pipeline Run.
-
-Inspect the merged stdout and stderr captured from one action worker:
-
-```text
+```sh
 hkdl run logs demo baseline run-001
+hkdl run metrics demo baseline run-001
 ```
 
-The log also captures ordinary child processes that inherit the worker's output
-descriptors. It is raw local output with no redaction or size limit, so Variant
-code must not print secrets. Direct terminal writes and detached daemons are not
-captured. Existing Runs created before this feature may have no log.
+Use `hkdl --help` or add `--help` to a command to see its available options.
 
-## Retry
+## How experiments are organized
 
-A failed, interrupted, or abandoned action is retried as a new Run:
+An **Experiment** groups related research. Each **Variant** contains independently editable code and configuration.
 
-```text
-hkdl run retry demo baseline run-003
+Training, evaluation, and export each create a **Run** that records the inputs and outcome of that execution. Successful training also creates a **Model**, which can be evaluated or exported.
+
+Editing a Variant does not rewrite previous Runs. Retrying a failed or interrupted execution creates a new Run linked to its parent:
+
+```sh
+hkdl run retry demo baseline run-001
 ```
 
-The parent stays sealed and the child records `retry_of`. A valid last
-checkpoint may be used to continue training. Retry preserves the captured
-research inputs; `--tracker none|local|mlflow|local+mlflow` selects tracking for
-the new attempt without editing the parent. Without an override, tracking is
-resolved from the current workspace setting for JSON authoring or the current
-Variant's tracker for legacy YAML authoring.
+Training can resume from a valid checkpoint when the captured Variant code supports it.
 
-## Delete a Variant
+## Features
 
-Preview the complete Variant-owned closure first:
+- **Reusable Templates:** Start with bundled ResNet18 classification or YOLO26n object-detection examples, then edit the copied Variant source.
+- **Repeatable execution:** Capture research inputs, train with multiple seeds, and evaluate named cases.
+- **Result inspection:** Read logs and metrics from the CLI or compare Runs and learning curves in the local web interface.
+- **Tracking:** Record metrics locally or connect an external MLflow server.
+- **Environment reuse:** Share matching execution environments while protecting environments used by active Runs.
+- **Explicit lifecycle operations:** Preview rename, deletion, migration, and committed Code promotion before applying them.
 
-```text
-hkdl variant delete demo baseline --dry-run
+Existing Variants retain their copied Template source when HKDL is updated. New Template versions do not alter previous experiments or captured execution inputs.
+
+## Work with coding agents
+
+Ask your coding agent to read the research root's `AGENTS.md` before working on experiments. It describes the HKDL workflow, CLI usage, data ownership, and operations that require confirmation.
+
+For local preferences, create an optional `AGENTS.user.md` at the research root instead of editing the HKDL-managed `AGENTS.md`. Use it for execution limits, preferred devices, and reporting conventions. For example:
+
+```md
+# Local experiment guidance
+
+- Use CPU unless I explicitly request another device.
+- Ask before starting training that is expected to take more than 10 minutes.
+- Report Run IDs, final status, and key metrics in Korean.
 ```
 
-The command removes only the selected Variant's active binding closure and
-moves its current authored root plus every output root retained under current
-or historical Experiment and Variant names to recoverable transaction trash.
-Its parent Experiment, sibling Variants, immutable CAS and derivation history,
-shared environments, and external MLflow state remain. Every owned Run must be
-terminal and lease-free. After deletion completes, its current and historical
-names may be claimed by a new Variant entity while old evidence remains
-addressable by immutable hashes.
+`workspace init` installs the default guide when `AGENTS.md` is absent. For an existing or modified file, choose to keep it, back it up and replace it, or preserve it as `AGENTS.user.md` before installing the default. An existing `AGENTS.user.md` is never overwritten.
 
-When active child Variants exist, dry-run returns exit 5 and lists every direct
-and transitive descendant. A normal invocation strongly recommends deleting or
-reorganizing those children first. HKDL can continue their active lineage around
-the deleted Variant without rewriting immutable derivation history, but doing so
-requires a dedicated `[y/N]` approval before the separate final deletion
-confirmation. Declining the lineage step returns exit 5 without asking the final
-question; declining only the final deletion question is a normal cancellation.
-There is no `--yes` bypass. Any changed child set, binding HEAD, owned closure or
-lease after confirmation rejects the operation without silent expansion.
+The default guide instructs agents to read `AGENTS.user.md` when present. Managed updates refresh only unmodified HKDL-owned guidance; user files and local edits remain unchanged. Rerun `hkdl workspace init` to explicitly adopt the installed guide, or consult the version-specific GitHub link printed by HKDL. Git tracking in an independent workspace is user-controlled.
 
-## Promote Variant Code
+Local preferences supplement the standard guide while retaining its data-preservation and confirmation rules.
 
-Promote committed Code from a validated Source Variant into an unchanged Target
-Variant while keeping the Target identity and Options:
+## Update
 
-```text
-hkdl variant promote demo tuned --to baseline --dry-run
-hkdl variant promote demo tuned --to baseline
+Moving from public 1.2.2 to 2.0.0 requires an explicit source update and any needed research migration. Start with [Moving from 1.2.2 to 2.0.0](docs/user/migrating-to-2.0.md); use the new CLI for migration before resuming research. The guide identifies the exact release and artifacts required for that transition.
+
+For a managed installation, select the supplied release bundle:
+
+```sh
+hkdl update BUNDLE.zip
 ```
 
-Promotion copies the Source's committed `code.json` meaning and complete `src/`
-tree into a new Target revision. The Target `options.json` remains unchanged;
-the Source Variant and its active owned closure are deleted after the Target
-revision commits, while immutable Source provenance remains addressable by
-hash. Source must derive from Target and Target Code must not have changed from
-that integration point. Dirty drafts, unrelated lineage, Target divergence,
-active Target execution, nonterminal or leased Source Runs, and active Source
-descendants return exit 5 before prompting.
+For a public source checkout, use `hkdl update` without a bundle.
 
-Dry-run is read-only. A ready apply shows the exact Code delta and asks one
-`[y/N]` question that explicitly includes Source deletion; there is no `--yes`
-bypass. Promotion and Source deletion are separately journaled around their
-binding transactions, so pre-Target-HEAD failure restores the old Target and a
-post-HEAD retry completes the already-confirmed Target publication and Source
-deletion. The deleted Source names become reusable. Full three-way conflict
-resolution, Options merge, cross-Experiment promotion and Experiment merge are
-not supported.
+HKDL previews the update and asks for confirmation. See [Updating HKDL](docs/user/updating.md) for requirements, data preservation, and migration guidance.
 
-## Delete an Experiment
-
-Preview the complete deletion closure first:
-
-```text
-hkdl experiment delete demo --dry-run
-```
-
-Run the command without `--dry-run` to see the same plan and answer the final
-`[y/N]` question. Experiment deletion is intentionally all-or-nothing and has
-no `--yes` bypass. Any nonterminal Run or held Run lease blocks the operation;
-HKDL reports every blocker with its persisted status, lease state, reason, and
-next action before returning exit 5 without prompting.
-
-On confirmation, HKDL revalidates the exact plan, moves the current authored
-Experiment root and all output roots retained under its current or historical
-names to recoverable transaction trash, and removes the selected Experiment's
-active bindings in one transaction. Other Experiments, immutable CAS objects
-and blobs, binding history, shared environments, and external MLflow state are
-preserved. After deletion completes, the deleted Experiment name may be claimed
-by a new entity without rewriting prior binding transactions.
-If a confirmed deletion is interrupted, repeat the same non-dry-run command;
-HKDL rolls back unpublished work or completes an already-published deletion
-before starting any new plan.
-
-## Schema compatibility
-
-New empty workspaces using the bundled schema-2 Templates create
-`experiment.json`, `code.json`, and `options.json`. The JSON files contain
-research inputs; names, hashes, revision history, and tracker settings are
-managed separately. Existing YAML workspaces keep schema-1 `experiment.yaml`
-and `variant.yaml` until an explicit authoring migration.
-
-There are three separate migration operations:
-
-| Operation | Scope |
-| --- | --- |
-| `hkdl migrate <path>` | Validate one legacy authored YAML file. Schema 1 is current for this single-file boundary; no rewrite is registered. |
-| `hkdl migrate --all --dry-run` | Preview importing the complete legacy workspace into v2 object authority. Apply uses `--all` with confirmation and preserves existing authored/output bytes. |
-| `hkdl migrate --authoring --dry-run` | Preview YAML-to-JSON draft conversion and historical Run/Model graph replay in an already active v2 workspace, including JSON workspaces with older graph evidence. Apply requires explicit `--authoring --yes`. |
-
-Authoring migration preserves uncommitted research edits and existing output
-bytes. It reports graph remapping, tracker/lease conflicts, space estimates,
-and a plan digest. If legacy tracker defaults disagree, explicitly select the
-future default with `--tracker-default local` (also `none`, `mlflow`, or
-`local,mlflow`). This preserves historical tracker evidence; repeat the same
-selection on apply. `--expect-plan sha256:<64hex>` on apply binds the operation
-to the reviewed digest. Apply takes a short exclusive maintenance window;
-ordinary commands return exit 5 and the web returns 503 until it completes or
-an interrupted cutover is explicitly recovered.
-
-For single-file validation:
-
-```text
-hkdl migrate experiments/demo/experiment.yaml
-hkdl migrate experiments/demo/baseline/variant.yaml
-```
-
-`CURRENT` selects v2 storage authority; the separate
-`.hkdl/store/AUTHORING_CURRENT` marker selects JSON authoring. A workspace can
-have v2 storage while still authoring YAML. Do not edit either marker manually
-or infer that output files are disposable from its presence. Review migration
-readiness, blockers, and the reported changes before applying. Unsupported
-single-file schema versions fail without changing the target; generated Run
-and Model records cannot be migrated in place by `migrate <path>`.
-
-## ResNet18 fixtures
-
-`resnet18@1.1.0` supplies schema-2 JSON authoring and includes the attributed
-small TF-Flowers JPEG fixture, two evaluation cases (`default` and `daisy-only`),
-prediction result output, ONNX
-export support, checkpoint continuation, and optional MLflow dependencies.
-It records loss and per-batch wall time and performs no dataset or
-pretrained-weight download at runtime. Immutable `1.0.0` and `1.0.1` remain
-available for legacy authoring.
-
-## YOLO26n object detection
-
-`yolo26n@1.1.0` supplies schema-2 JSON authoring and includes a deterministic
-synthetic shapes dataset with eight training images, four validation images,
-and two classes (`circle` and
-`rectangle`). It trains the architecture from scratch for ten epochs and
-records loss and per-epoch wall time. It performs no dataset or
-pretrained-weight download at runtime. Immutable `1.0.0` and `1.0.1` remain
-available for legacy authoring.
-
-```text
-hkdl experiment create detection --template yolo26n
-hkdl variant create detection baseline
-hkdl run train detection baseline smoke --seed 0 -d cpu
-hkdl run eval detection baseline smoke default --seed 0
-hkdl model list detection baseline
-```
-
-The Template reports finite detection metrics, writes deterministic prediction
-JSON, and exports a fixed-shape ONNX model together with its AGPL license.
-Ultralytics network checks, automatic dependency installation, and third-party
-tracking integrations are disabled. HKDL remains the only tracking owner.
-
-## Tracking
-
-For JSON authoring, the workspace default is stored in `.hkdl/settings.json`;
-an absent settings file means `local`. Inspect or change it with:
-
-```text
-hkdl settings show
-hkdl settings tracker set local
-```
-
-`run train` and `run retry` accept `--tracker` to override that default for one
-invocation. Eval and Export use the workspace default. Legacy YAML Variants
-instead keep `tracker.backend` in `variant.yaml`, with bundled `1.0.1` Variants
-defaulting to `local`. Tracker settings do not belong in schema-2 Code/Options.
-Training scalars, including `train.batch_seconds` for ResNet18 and
-`train.epoch_seconds` for YOLO26n, are stored with the Run and can be inspected
-with:
-
-```text
-.venv/bin/hkdl run metrics <experiment> <variant> <run-id>
-```
-
-Follow an active local-tracked Train Run from another terminal:
-
-```text
-.venv/bin/hkdl run metrics <experiment> <variant> <run-id> --follow
-```
-
-Follow prints existing metric rows, then newly completed rows until the Run
-becomes terminal. It remains a read-only local view: JSON streaming, progress
-percentages, ETA, and MLflow history polling are not provided.
-
-The settings command and `--tracker` accept `none`, `local`, `mlflow`, or
-`local+mlflow`. In legacy YAML use `tracker.backend: none` to disable tracking,
-`mlflow` for MLflow only, or `[local, mlflow]` for both. MLflow requires an
-external `MLFLOW_TRACKING_URI`.
-Every local execution Run gets a distinct external Run. Retry uses a new
-external identity with parent relation tags. HKDL does not start or manage an
-MLflow server.
+Version-specific changes are listed in the [release notes](https://github.com/hukuhaka/hkdl/releases).
 
 ## License
 
-HKDL Core and files without a more specific notice are released under the MIT
-License. The bundled TF-Flowers fixture retains its own attribution and CC BY
-4.0 terms in its `ATTRIBUTION.md`.
+HKDL Core is licensed under MIT. Bundled data and Templates may have additional terms:
 
-The `yolo26n` Template, Variants derived from it, and model artifacts produced
-with Ultralytics are licensed under GNU AGPL version 3 or later. Its source
-bundle includes the complete license and scope notice. Commercial users who do
-not wish to comply with the AGPL requirements must obtain an Ultralytics
-Enterprise License.
+- The TF-Flowers fixture is provided under CC BY 4.0 with its included attribution.
+- The Ultralytics-based YOLO26n Template and applicable derived code and artifacts are subject to AGPL-3.0-or-later. An alternative commercial license is available from Ultralytics.
+
+See the included license and attribution files for details.

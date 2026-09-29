@@ -1,13 +1,9 @@
 """HKDL experiment management control plane."""
 
-from .authoring import (
-    Authoring,
-    ExperimentRecord,
-    VariantRecord,
-)
-from .config import (
+from hkdl.authoring.authoring import Authoring
+from hkdl.authoring.authoring_records import ExperimentRecord, VariantRecord
+from hkdl.authoring.config import (
     COMPONENT_KINDS,
-    ContractError,
     dump_yaml,
     load_yaml_file,
     validate_experiment,
@@ -16,7 +12,33 @@ from .config import (
     validate_template_variant_seed,
     validate_variant,
 )
-from .environments import (
+from hkdl.execution.evaluation import (
+    Evaluation,
+    EvaluationFailure,
+    EvaluationInterrupted,
+    LifecycleConflict,
+)
+from hkdl.execution.export import Export, ExportFailure, ExportInterrupted
+from hkdl.execution.recovery import Recovery, RecoveryFailure, RecoveryInterrupted
+from hkdl.execution.run_contracts import (
+    EVAL_COMPONENTS,
+    EXPORT_COMPONENTS,
+    MODEL_ID_PATTERN,
+    RUN_ID_PATTERN,
+    TRAIN_COMPONENTS,
+    validate_evaluation,
+    validate_evaluation_readiness,
+    validate_export_readiness,
+    validate_model,
+    validate_request,
+    validate_snapshot,
+    validate_state,
+    validate_training_readiness,
+)
+from hkdl.execution.run_records import ModelRecord, RunRecord
+from hkdl.execution.training import Training, TrainingFailure, TrainingInterrupted
+from hkdl.interfaces.status_rendering import render_status_tree
+from hkdl.runtime.environments import (
     EnvironmentFailure,
     EnvironmentHandle,
     EnvironmentIdentity,
@@ -25,7 +47,15 @@ from .environments import (
     PrunePlan,
     PruneResult,
 )
-from .storage import (
+from hkdl.runtime.runtime import (
+    RuntimeFailure,
+    RuntimeInterrupted,
+    RuntimeOwnershipConflict,
+    VariantRuntime,
+)
+from hkdl.storage.runs import RunStore
+from hkdl.storage.status import Status
+from hkdl.storage.storage import (
     AlreadyExistsError,
     LockUnavailableError,
     NotFoundError,
@@ -43,38 +73,8 @@ from .storage import (
     try_directory_lock,
     validate_repository_root,
 )
-from .run_contracts import (
-    EVAL_COMPONENTS,
-    EXPORT_COMPONENTS,
-    MODEL_ID_PATTERN,
-    RUN_ID_PATTERN,
-    TRAIN_COMPONENTS,
-    validate_evaluation,
-    validate_request,
-    validate_model,
-    validate_evaluation_readiness,
-    validate_export_readiness,
-    validate_snapshot,
-    validate_state,
-    validate_training_readiness,
-)
-from .runs import ModelRecord, RunRecord, RunStore
-from .export import Export, ExportFailure, ExportInterrupted
-from .evaluation import (
-    Evaluation,
-    EvaluationFailure,
-    EvaluationInterrupted,
-    LifecycleConflict,
-)
-from .runtime import (
-    RuntimeFailure,
-    RuntimeInterrupted,
-    RuntimeOwnershipConflict,
-    VariantRuntime,
-)
-from .recovery import Recovery, RecoveryFailure, RecoveryInterrupted
-from .status import Status, render_status_tree
-from .training import Training, TrainingFailure, TrainingInterrupted
+
+from .errors import ContractError
 
 __all__ = [
     "COMPONENT_KINDS",

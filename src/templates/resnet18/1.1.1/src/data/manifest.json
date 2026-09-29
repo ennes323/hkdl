@@ -1,0 +1,368 @@
+{
+  "schema_version": 1,
+  "source": {
+    "title": "TF-Flowers",
+    "author": "Ye Xu",
+    "doi": "10.6084/m9.figshare.19166516.v1",
+    "url": "https://figshare.com/articles/dataset/TF-Flowers/19166516",
+    "license": "CC BY 4.0",
+    "license_url": "https://creativecommons.org/licenses/by/4.0/",
+    "archive": "TF-Flowers.zip",
+    "archive_md5": "4dc888d4b39b63404feed35ce61e75c0",
+    "selection": "first 24 JPEG names per class in UTF-8 byte order; first 16 train and next 8 eval"
+  },
+  "processing": {
+    "mode": "RGB",
+    "crop": "center-square",
+    "size": [
+      64,
+      64
+    ],
+    "resize": "bilinear",
+    "format": "JPEG",
+    "quality": 90,
+    "metadata": "removed"
+  },
+  "classes": [
+    "daisy",
+    "sunflowers"
+  ],
+  "entries": [
+    {
+      "source": "TF-Flowers/daisy/100080576_f52e8ee070_n.jpg",
+      "split": "train",
+      "class": "daisy",
+      "path": "train/daisy/100080576_f52e8ee070_n.jpg",
+      "sha256": "6beb52b5c6c6c037d85fc2188cd31dcb437bef15995d117059a764a4c575da46"
+    },
+    {
+      "source": "TF-Flowers/daisy/10140303196_b88d3d6cec.jpg",
+      "split": "train",
+      "class": "daisy",
+      "path": "train/daisy/10140303196_b88d3d6cec.jpg",
+      "sha256": "0c6addb31a623c8fb403bbbf507d222b1265d4d1fbeacdec97d1ad77236a5eaa"
+    },
+    {
+      "source": "TF-Flowers/daisy/10172379554_b296050f82_n.jpg",
+      "split": "train",
+      "class": "daisy",
+      "path": "train/daisy/10172379554_b296050f82_n.jpg",
+      "sha256": "542650c243aa15aebb66f746e9ec404d37d4cafc1ec02f8ac4858d105372cc62"
+    },
+    {
+      "source": "TF-Flowers/daisy/10172567486_2748826a8b.jpg",
+      "split": "train",
+      "class": "daisy",
+      "path": "train/daisy/10172567486_2748826a8b.jpg",
+      "sha256": "a34233b4bfec34feeb9189d1ccbc4e19f0e5b0f56f014d94c19b7ad924db5090"
+    },
+    {
+      "source": "TF-Flowers/daisy/10172636503_21bededa75_n.jpg",
+      "split": "train",
+      "class": "daisy",
+      "path": "train/daisy/10172636503_21bededa75_n.jpg",
+      "sha256": "1e52677ab68bb3085e7d7d78d2250e872410e32e0ae243e5d2ec8fb69c6b5f2c"
+    },
+    {
+      "source": "TF-Flowers/daisy/102841525_bd6628ae3c.jpg",
+      "split": "train",
+      "class": "daisy",
+      "path": "train/daisy/102841525_bd6628ae3c.jpg",
+      "sha256": "b3e20cd5150da3ab8d1ef1ff1695f75243724b18c99bc9250632bbebfaac6cc2"
+    },
+    {
+      "source": "TF-Flowers/daisy/1031799732_e7f4008c03.jpg",
+      "split": "train",
+      "class": "daisy",
+      "path": "train/daisy/1031799732_e7f4008c03.jpg",
+      "sha256": "788cb53577368c7ed3ea3c01850d10975e8499843aa86b5236be537b0f8fb58c"
+    },
+    {
+      "source": "TF-Flowers/daisy/10391248763_1d16681106_n.jpg",
+      "split": "train",
+      "class": "daisy",
+      "path": "train/daisy/10391248763_1d16681106_n.jpg",
+      "sha256": "39658c4b5cebed81415b7c93b5d92899c7bd0fc23e762ec38efcbf688584ed89"
+    },
+    {
+      "source": "TF-Flowers/daisy/10437754174_22ec990b77_m.jpg",
+      "split": "train",
+      "class": "daisy",
+      "path": "train/daisy/10437754174_22ec990b77_m.jpg",
+      "sha256": "0e7cb634b187c4605ecdd27ad9ae6bc04eb916de43bb4aec1f65e6e2eb87d615"
+    },
+    {
+      "source": "TF-Flowers/daisy/10437770546_8bb6f7bdd3_m.jpg",
+      "split": "train",
+      "class": "daisy",
+      "path": "train/daisy/10437770546_8bb6f7bdd3_m.jpg",
+      "sha256": "1d7fa74db8bf9858c35d480f86a7c2ce6445a6818d8a54f60c6e070c5df96696"
+    },
+    {
+      "source": "TF-Flowers/daisy/10437929963_bc13eebe0c.jpg",
+      "split": "train",
+      "class": "daisy",
+      "path": "train/daisy/10437929963_bc13eebe0c.jpg",
+      "sha256": "21f7fb230139774c94d6aad6ac5501e3965d524ad6c4b301565333919d711b1a"
+    },
+    {
+      "source": "TF-Flowers/daisy/10466290366_cc72e33532.jpg",
+      "split": "train",
+      "class": "daisy",
+      "path": "train/daisy/10466290366_cc72e33532.jpg",
+      "sha256": "36348481368cb5dfdfb042968ff366612c03b921201697d0f8a968762b18f421"
+    },
+    {
+      "source": "TF-Flowers/daisy/10466558316_a7198b87e2.jpg",
+      "split": "train",
+      "class": "daisy",
+      "path": "train/daisy/10466558316_a7198b87e2.jpg",
+      "sha256": "aa102069767bc61b04c5c13abfc020946c26911120e8f363a0422b879bb22a3e"
+    },
+    {
+      "source": "TF-Flowers/daisy/10555749515_13a12a026e.jpg",
+      "split": "train",
+      "class": "daisy",
+      "path": "train/daisy/10555749515_13a12a026e.jpg",
+      "sha256": "81f5b5ed73f4be3f14b271b2af5cdc78fcee8cbe800f863e885811a90b0b1e95"
+    },
+    {
+      "source": "TF-Flowers/daisy/10555815624_dc211569b0.jpg",
+      "split": "train",
+      "class": "daisy",
+      "path": "train/daisy/10555815624_dc211569b0.jpg",
+      "sha256": "4152231cd5c0e65c780bebf6dce190a6859b1075c95e0f91d729100b15690a62"
+    },
+    {
+      "source": "TF-Flowers/daisy/10555826524_423eb8bf71_n.jpg",
+      "split": "train",
+      "class": "daisy",
+      "path": "train/daisy/10555826524_423eb8bf71_n.jpg",
+      "sha256": "b1502449d610d247782a3bf7f254fedecfd16e93b92774747c90a5c7c373da98"
+    },
+    {
+      "source": "TF-Flowers/daisy/10559679065_50d2b16f6d.jpg",
+      "split": "eval",
+      "class": "daisy",
+      "path": "eval/daisy/10559679065_50d2b16f6d.jpg",
+      "sha256": "6b79f958b5769efe0dc9678d435906cd64f2abfc06169f52fcd0288a216782ee"
+    },
+    {
+      "source": "TF-Flowers/daisy/105806915_a9c13e2106_n.jpg",
+      "split": "eval",
+      "class": "daisy",
+      "path": "eval/daisy/105806915_a9c13e2106_n.jpg",
+      "sha256": "9ff8d86ed85732743250614d8a828dbdb9a8637d1aca31274838d912e2066e3a"
+    },
+    {
+      "source": "TF-Flowers/daisy/10712722853_5632165b04.jpg",
+      "split": "eval",
+      "class": "daisy",
+      "path": "eval/daisy/10712722853_5632165b04.jpg",
+      "sha256": "1a2ea9aef8e3a12b5c296beea969fd003e582c91697a84d70cb0bdfea7c696c5"
+    },
+    {
+      "source": "TF-Flowers/daisy/107592979_aaa9cdfe78_m.jpg",
+      "split": "eval",
+      "class": "daisy",
+      "path": "eval/daisy/107592979_aaa9cdfe78_m.jpg",
+      "sha256": "8312a5ea7d0c3775e249b23081191ee81eab7474a44574e54288c0962d6df765"
+    },
+    {
+      "source": "TF-Flowers/daisy/10770585085_4742b9dac3_n.jpg",
+      "split": "eval",
+      "class": "daisy",
+      "path": "eval/daisy/10770585085_4742b9dac3_n.jpg",
+      "sha256": "b36c2971f6473c6889b9ac7e5519c4983babe0728b45045ba9473e1591345175"
+    },
+    {
+      "source": "TF-Flowers/daisy/10841136265_af473efc60.jpg",
+      "split": "eval",
+      "class": "daisy",
+      "path": "eval/daisy/10841136265_af473efc60.jpg",
+      "sha256": "b1dba261e1c578ee8bbba2eb41b22fe28f8ec24c4a342e1daeab92eea4e4966e"
+    },
+    {
+      "source": "TF-Flowers/daisy/10993710036_2033222c91.jpg",
+      "split": "eval",
+      "class": "daisy",
+      "path": "eval/daisy/10993710036_2033222c91.jpg",
+      "sha256": "8d0a02c6b71ebcaa1434f1c4582cd76735c0a0071113152a7b94a6772bdecf54"
+    },
+    {
+      "source": "TF-Flowers/daisy/10993818044_4c19b86c82.jpg",
+      "split": "eval",
+      "class": "daisy",
+      "path": "eval/daisy/10993818044_4c19b86c82.jpg",
+      "sha256": "4b7179d1e141bafdbd041ff1e2644065ed43eb4c45116b9d9a044978898ff662"
+    },
+    {
+      "source": "TF-Flowers/sunflowers/1008566138_6927679c8a.jpg",
+      "split": "train",
+      "class": "sunflowers",
+      "path": "train/sunflowers/1008566138_6927679c8a.jpg",
+      "sha256": "d108004168536932a461d727e5e7b6fbd5a90dcf02713d8de4e11e61a4173390"
+    },
+    {
+      "source": "TF-Flowers/sunflowers/1022552002_2b93faf9e7_n.jpg",
+      "split": "train",
+      "class": "sunflowers",
+      "path": "train/sunflowers/1022552002_2b93faf9e7_n.jpg",
+      "sha256": "f23620991fc068d0e04e995e1001c3065fd63884a11d2a1a27063e8dfb068ca7"
+    },
+    {
+      "source": "TF-Flowers/sunflowers/1022552036_67d33d5bd8_n.jpg",
+      "split": "train",
+      "class": "sunflowers",
+      "path": "train/sunflowers/1022552036_67d33d5bd8_n.jpg",
+      "sha256": "503fff03e368aee40ee10c1582b72b87acafdb037c9d08e787a18a18741da970"
+    },
+    {
+      "source": "TF-Flowers/sunflowers/10386503264_e05387e1f7_m.jpg",
+      "split": "train",
+      "class": "sunflowers",
+      "path": "train/sunflowers/10386503264_e05387e1f7_m.jpg",
+      "sha256": "9133915ac423e49da7604a0bf5966313e7327b41b1ac369802e391fe179d13a8"
+    },
+    {
+      "source": "TF-Flowers/sunflowers/10386522775_4f8c616999_m.jpg",
+      "split": "train",
+      "class": "sunflowers",
+      "path": "train/sunflowers/10386522775_4f8c616999_m.jpg",
+      "sha256": "5920dd6dc9ac9d675bf2e91a7ac292bb429928361c6091efd9ce87f00b7a5a36"
+    },
+    {
+      "source": "TF-Flowers/sunflowers/10386525005_fd0b7d6c55_n.jpg",
+      "split": "train",
+      "class": "sunflowers",
+      "path": "train/sunflowers/10386525005_fd0b7d6c55_n.jpg",
+      "sha256": "dcf4f8528802e92160c49fe497f1819f0afdae520292b2fa6344f70ce8f75534"
+    },
+    {
+      "source": "TF-Flowers/sunflowers/10386525695_2c38fea555_n.jpg",
+      "split": "train",
+      "class": "sunflowers",
+      "path": "train/sunflowers/10386525695_2c38fea555_n.jpg",
+      "sha256": "c4b89d9854c907596c3dce1b4bea25132679629aabc4f7b6f6bf47f303278658"
+    },
+    {
+      "source": "TF-Flowers/sunflowers/10386540106_1431e73086_m.jpg",
+      "split": "train",
+      "class": "sunflowers",
+      "path": "train/sunflowers/10386540106_1431e73086_m.jpg",
+      "sha256": "3de519df0e2c0decf722c18f991646477baf62d1f402526d38ee6486bef13bd4"
+    },
+    {
+      "source": "TF-Flowers/sunflowers/10386540696_0a95ee53a8_n.jpg",
+      "split": "train",
+      "class": "sunflowers",
+      "path": "train/sunflowers/10386540696_0a95ee53a8_n.jpg",
+      "sha256": "b3362e62e136ba33b7f47152e56dbf84b4a456f830b6e61738f5424f35d1efcc"
+    },
+    {
+      "source": "TF-Flowers/sunflowers/10386702973_e74a34c806_n.jpg",
+      "split": "train",
+      "class": "sunflowers",
+      "path": "train/sunflowers/10386702973_e74a34c806_n.jpg",
+      "sha256": "03087a1fda02a4380a6db044ea9de6342ee52834131ee054930da6ba32e9d56e"
+    },
+    {
+      "source": "TF-Flowers/sunflowers/1043442695_4556c4c13d_n.jpg",
+      "split": "train",
+      "class": "sunflowers",
+      "path": "train/sunflowers/1043442695_4556c4c13d_n.jpg",
+      "sha256": "bf929231704c16dbef6714505bbd08791333f11be1f8c99b2089552ba02cb277"
+    },
+    {
+      "source": "TF-Flowers/sunflowers/1044296388_912143e1d4.jpg",
+      "split": "train",
+      "class": "sunflowers",
+      "path": "train/sunflowers/1044296388_912143e1d4.jpg",
+      "sha256": "7832c87498c52a3f49cc7f67aba8881d54f5ec1c1e296c17d934b95aebb255cc"
+    },
+    {
+      "source": "TF-Flowers/sunflowers/1064662314_c5a7891b9f_m.jpg",
+      "split": "train",
+      "class": "sunflowers",
+      "path": "train/sunflowers/1064662314_c5a7891b9f_m.jpg",
+      "sha256": "37495387dbc1e9cbe29f6c8dedd6e21ea396cd7425071818840d560a8d0ed717"
+    },
+    {
+      "source": "TF-Flowers/sunflowers/10862313945_e8ed9202d9_m.jpg",
+      "split": "train",
+      "class": "sunflowers",
+      "path": "train/sunflowers/10862313945_e8ed9202d9_m.jpg",
+      "sha256": "d4cac274a47554d50525e9def361990c757bdc495a467cd064836abac028cd2e"
+    },
+    {
+      "source": "TF-Flowers/sunflowers/11881770944_22b4f2f8f6_n.jpg",
+      "split": "train",
+      "class": "sunflowers",
+      "path": "train/sunflowers/11881770944_22b4f2f8f6_n.jpg",
+      "sha256": "a58760243dda9648a4078cedb0ee862b924ef3e9d2032648122878a7d08bc404"
+    },
+    {
+      "source": "TF-Flowers/sunflowers/1217254584_4b3028b93d.jpg",
+      "split": "train",
+      "class": "sunflowers",
+      "path": "train/sunflowers/1217254584_4b3028b93d.jpg",
+      "sha256": "990a1e74f9bc79818507d7cf03db7cf4dbbf088e0fcb4f3bb89f1526cd142d4a"
+    },
+    {
+      "source": "TF-Flowers/sunflowers/12282924083_fb80aa17d4_n.jpg",
+      "split": "eval",
+      "class": "sunflowers",
+      "path": "eval/sunflowers/12282924083_fb80aa17d4_n.jpg",
+      "sha256": "337ff9bb145387fa9d67a49ddc533c6407d967c145c783e61492dca535cb8928"
+    },
+    {
+      "source": "TF-Flowers/sunflowers/1240624822_4111dde542.jpg",
+      "split": "eval",
+      "class": "sunflowers",
+      "path": "eval/sunflowers/1240624822_4111dde542.jpg",
+      "sha256": "aec89d5d459c44094a8a38a92fff3ef7602f8370e4baeb93e129434b9658b5b1"
+    },
+    {
+      "source": "TF-Flowers/sunflowers/1240625276_fb3bd0c7b1.jpg",
+      "split": "eval",
+      "class": "sunflowers",
+      "path": "eval/sunflowers/1240625276_fb3bd0c7b1.jpg",
+      "sha256": "4ed18ea1bdd503cde319739563d02f58dac0b728031f381241db0870a1b80f48"
+    },
+    {
+      "source": "TF-Flowers/sunflowers/1240626292_52cd5d7fb1_m.jpg",
+      "split": "eval",
+      "class": "sunflowers",
+      "path": "eval/sunflowers/1240626292_52cd5d7fb1_m.jpg",
+      "sha256": "20860894f65a2f0334107f80f0847cbd0ccfd03a17e0540a748a2fa4ebcc7987"
+    },
+    {
+      "source": "TF-Flowers/sunflowers/1244774242_25a20d99a9.jpg",
+      "split": "eval",
+      "class": "sunflowers",
+      "path": "eval/sunflowers/1244774242_25a20d99a9.jpg",
+      "sha256": "31b9a840d3b6e3ee77f645ada8bbde6a437ad325b67c6d0c009f32146923122b"
+    },
+    {
+      "source": "TF-Flowers/sunflowers/12471290635_1f9e3aae16_n.jpg",
+      "split": "eval",
+      "class": "sunflowers",
+      "path": "eval/sunflowers/12471290635_1f9e3aae16_n.jpg",
+      "sha256": "f606d6d74fbabea4fefaf1e04168d1d727f09848e52e6b30fb97f302655f8719"
+    },
+    {
+      "source": "TF-Flowers/sunflowers/12471441503_d188b5f31a_m.jpg",
+      "split": "eval",
+      "class": "sunflowers",
+      "path": "eval/sunflowers/12471441503_d188b5f31a_m.jpg",
+      "sha256": "4f1bab57df8d378f6109a1c8871b75c2f6b7d3fed21ddf5bb11fcf8be208573e"
+    },
+    {
+      "source": "TF-Flowers/sunflowers/12471443383_b71e7a7480_m.jpg",
+      "split": "eval",
+      "class": "sunflowers",
+      "path": "eval/sunflowers/12471443383_b71e7a7480_m.jpg",
+      "sha256": "59303fcc06e6dbc15b34b08bbaa6752461708cf4f611c9c6294870020974d69e"
+    }
+  ]
+}
